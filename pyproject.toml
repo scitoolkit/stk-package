@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scitoolkit"
+version = "0.1.0"
+description = "A community repository for scientific agentic tools - discover, share, and use AI tools for science"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Alex Roman"}
+]
+keywords = ["ai", "agents", "science", "tools", "mcp", "orchestral", "astrophysics", "physics", "quantum"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/adroman/scitoolkit"
+Documentation = "https://github.com/adroman/scitoolkit#readme"
+Repository = "https://github.com/adroman/scitoolkit"
+Issues = "https://github.com/adroman/scitoolkit/issues"
+
+dependencies = [
+    "click>=8.0",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "docker>=7.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+scitoolkit = "scitoolkit.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scitoolkit*"]

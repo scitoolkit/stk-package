@@ -1,0 +1,20 @@
+name: {{name}}
+version: 0.1.0
+description: A brief description of your toolkit
+author: Your Name
+email: your.email@example.com
+license: MIT
+homepage: https://github.com/yourusername/{{name}}
+category: general  # Options: astro, hep, quantum, neutrino, cosmology, general
+keywords:
+  - science
+  - research
+python_version: "3.11"
+
+tools:
+  - name: example_tool
+    function: tools.tool_example.example_tool
+    description: An example tool that demonstrates the basic Orchestral structure
+  - name: text_processor
+    function: tools.tool_example.text_processor
+    description: Another example tool showing text processing
