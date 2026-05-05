@@ -1,22 +1,51 @@
 """
 Tool execution logger for SciToolkit.
 
-Provides thread-safe logging of tool executions with:
-- Daily log files
-- Structured JSONL tool call log
-- Auto-rotation (30 day retention)
-- Performance metrics
+Provides thread-safe logging of:
+- Tool executions (start / output / complete) — used by serve to track
+  individual tool calls.
+- Orchestrator-level events (subprocess spawn/crash, MCP client connect, etc.)
+  — used by ``scitoolkit serve`` for "what just happened" diagnostics.
+
+Outputs:
+
+- ``~/.scitoolkit/logs/YYYY-MM-DD.log`` — daily files, all events flow here.
+  Rotated after 30 days.
+- ``~/.scitoolkit/logs/tool_calls.jsonl`` — structured per-call records
+  (timestamp, toolkit, tool, args, duration, success). Append-only; not rotated.
+- ``~/.scitoolkit/logs/serve.log`` — append-only mirror of orchestrator events
+  and tool calls *during a serve session only*. Pruned on startup if it exceeds
+  the size limit (~10 MB). Opt-in via ``ToolLogger(serve_log=True)``; off by
+  default so install/list/uninstall don't pollute it.
+
+Event vocabulary for ``log_event(event=...)`` (free-form, but conventions
+matter for later log queries):
+
+    serve_started, serve_shutting_down,
+    toolkit_loaded, toolkit_skipped,
+    subprocess_spawned, subprocess_crashed, subprocess_restarting,
+    subprocess_failed_permanently,
+    mcp_client_connected, mcp_client_disconnected,
+    tools_list_changed.
+
+New event names are fine; keep snake_case and stable.
 """
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from collections import deque
 
 from ..config import LOGS_DIR
+
+
+SERVE_LOG_PATH = LOGS_DIR / "serve.log"
+SERVE_LOG_MAX_BYTES = 10 * 1024 * 1024  # ~10 MB before tail-prune on startup
+SERVE_LOG_TAIL_BYTES = 5 * 1024 * 1024  # keep ~last 5 MB on prune
 
 
 @dataclass
@@ -49,6 +78,20 @@ class ToolCallRecord:
         return asdict(self)
 
 
+@dataclass
+class EventRecord:
+    """Record of an orchestrator-level event (not tied to a specific tool call)."""
+    timestamp: str
+    event: str  # vocabulary in module docstring
+    toolkit: Optional[str]  # None for events not scoped to a toolkit
+    message: str
+    level: str  # info, warn, error
+    fields: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class ToolLogger:
     """
     Thread-safe logger for tool execution.
@@ -60,22 +103,30 @@ class ToolLogger:
     - Auto-rotation (keeps last 30 days)
     """
 
-    def __init__(self, max_memory_logs: int = 1000):
+    def __init__(self, max_memory_logs: int = 1000, *, serve_log: bool = False):
         """
         Initialize logger.
 
         Args:
             max_memory_logs: Maximum log entries to keep in memory
+            serve_log: If True, also write tool calls and events to
+                ~/.scitoolkit/logs/serve.log. Default False so install/list/
+                uninstall logging stays out of serve.log.
         """
         self._lock = threading.Lock()
         self._memory_logs = deque(maxlen=max_memory_logs)
         self._active_calls: Dict[str, ToolCallRecord] = {}  # tool_id -> record
+        self._serve_log_enabled = serve_log
 
         # Ensure logs directory exists
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Rotate old logs on startup
+        # Rotate old daily log files on startup
         self._rotate_logs()
+
+        if serve_log:
+            self._prune_serve_log_if_oversized()
+            self._write_serve_session_marker()
 
     def log_tool_start(self, toolkit: str, tool: str, args: Dict[str, Any]) -> str:
         """
@@ -106,13 +157,9 @@ class ToolLogger:
         with self._lock:
             self._active_calls[tool_id] = record
 
-            # Log to daily file
-            self._write_daily_log(
-                f"[{timestamp}] {toolkit}::{tool} - Starting",
-                level="info"
-            )
+            human = f"[{timestamp}] {toolkit}::{tool} - Starting"
+            self._write_daily_log(human, level="info")
 
-            # Add to memory
             entry = LogEntry(
                 timestamp=timestamp,
                 toolkit=toolkit,
@@ -121,6 +168,9 @@ class ToolLogger:
                 level="info"
             )
             self._memory_logs.append(entry)
+
+            if self._serve_log_enabled:
+                self._write_serve_log(human + "\n")
 
         return tool_id
 
@@ -143,13 +193,9 @@ class ToolLogger:
         timestamp = datetime.now().isoformat()
 
         with self._lock:
-            # Log to daily file
-            self._write_daily_log(
-                f"[{timestamp}] {toolkit}::{tool} - {message}",
-                level=level
-            )
+            human = f"[{timestamp}] {toolkit}::{tool} - {message}"
+            self._write_daily_log(human, level=level)
 
-            # Add to memory
             entry = LogEntry(
                 timestamp=timestamp,
                 toolkit=toolkit,
@@ -158,6 +204,9 @@ class ToolLogger:
                 level=level
             )
             self._memory_logs.append(entry)
+
+            if self._serve_log_enabled:
+                self._write_serve_log(human + "\n")
 
     def log_tool_complete(
         self,
@@ -201,18 +250,15 @@ class ToolLogger:
                 record.error = error
                 del self._active_calls[tool_id]
 
-            # Write to structured log
             self._write_tool_call_log(record)
 
-            # Log to daily file
             status = "✓ Completed" if success else "✗ Failed"
-            msg = f"[{timestamp}] {record.toolkit}::{record.tool} - {status} in {duration:.2f}s"
+            human = f"[{timestamp}] {record.toolkit}::{record.tool} - {status} in {duration:.2f}s"
             if error:
-                msg += f" - {error}"
+                human += f" - {error}"
 
-            self._write_daily_log(msg, level="success" if success else "error")
+            self._write_daily_log(human, level="success" if success else "error")
 
-            # Add to memory
             entry = LogEntry(
                 timestamp=timestamp,
                 toolkit=record.toolkit,
@@ -221,6 +267,9 @@ class ToolLogger:
                 level="success" if success else "error"
             )
             self._memory_logs.append(entry)
+
+            if self._serve_log_enabled:
+                self._write_serve_log(human + "\n")
 
     def get_recent_logs(self, limit: Optional[int] = None) -> List[LogEntry]:
         """
@@ -326,23 +375,134 @@ class ToolLogger:
             pass
 
     def _rotate_logs(self):
-        """Remove log files older than 30 days."""
+        """Remove daily log files older than 30 days."""
         try:
             cutoff_date = datetime.now() - timedelta(days=30)
 
             for log_file in LOGS_DIR.glob("*.log"):
-                # Parse date from filename (YYYY-MM-DD.log)
+                # Only match daily files of shape YYYY-MM-DD.log; leave
+                # serve.log and any other non-dated files untouched.
                 try:
-                    date_str = log_file.stem  # Get filename without extension
+                    date_str = log_file.stem
                     file_date = datetime.strptime(date_str, "%Y-%m-%d")
 
                     if file_date < cutoff_date:
                         log_file.unlink()
                 except (ValueError, OSError):
-                    # Skip files that don't match pattern or can't be deleted
                     continue
         except Exception:
             # Fail silently - rotation is not critical
+            pass
+
+    # ── serve.log support ────────────────────────────────────────────────
+
+    def log_event(
+        self,
+        event: str,
+        toolkit: Optional[str] = None,
+        message: str = "",
+        level: str = "info",
+        **fields,
+    ) -> None:
+        """
+        Log an orchestrator-level event.
+
+        Use this for things that aren't tied to a specific tool call:
+        subprocess spawn/crash, MCP client connection, toolkit skipped at
+        startup, etc. See module docstring for the event vocabulary.
+
+        Args:
+            event: short snake_case identifier (e.g. ``subprocess_spawned``)
+            toolkit: toolkit name if the event is scoped to one, else None
+            message: human-readable detail
+            level: ``info``, ``warn``, or ``error``
+            **fields: arbitrary structured fields (port, pid, restart_count, ...)
+                included in the JSONL payload and rendered as ``key=value`` in
+                the human-readable log lines.
+        """
+        timestamp = datetime.now().isoformat()
+        record = EventRecord(
+            timestamp=timestamp,
+            event=event,
+            toolkit=toolkit,
+            message=message,
+            level=level,
+            fields=fields or {},
+        )
+
+        with self._lock:
+            # Human-readable line for the daily file
+            scope = f" {toolkit}" if toolkit else ""
+            extra = (
+                " " + " ".join(f"{k}={v}" for k, v in record.fields.items())
+                if record.fields else ""
+            )
+            human = f"[{timestamp}] event={event}{scope} - {message}{extra}".rstrip()
+            self._write_daily_log(human, level=level)
+
+            # Memory ring (TUI consumes this later; uses LogEntry shape)
+            entry = LogEntry(
+                timestamp=timestamp,
+                toolkit=toolkit or "<orchestrator>",
+                tool=event,
+                message=message + extra,
+                level=level,
+            )
+            self._memory_logs.append(entry)
+
+            # Also append to serve.log if enabled
+            if self._serve_log_enabled:
+                self._write_serve_log(human + "\n")
+                # And one structured line for jq-friendly parsing
+                self._write_serve_log_jsonl(record.to_dict())
+
+    def _write_serve_log(self, line: str) -> None:
+        """Append a raw line to serve.log. Fail silently."""
+        try:
+            with open(SERVE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+
+    def _write_serve_log_jsonl(self, payload: Dict[str, Any]) -> None:
+        """Append a JSON line to serve.log (one-per-line, alongside human lines)."""
+        try:
+            with open(SERVE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("# " + json.dumps(payload) + "\n")
+        except Exception:
+            pass
+
+    def _write_serve_session_marker(self) -> None:
+        """Write a banner identifying a new serve session."""
+        bar = "═" * 63
+        marker = (
+            f"\n{bar}\n"
+            f"serve session started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"pid {os.getpid()}\n"
+            f"{bar}\n"
+        )
+        self._write_serve_log(marker)
+
+    def _prune_serve_log_if_oversized(self) -> None:
+        """If serve.log is over the size cap, keep the tail and discard the rest."""
+        try:
+            if not SERVE_LOG_PATH.exists():
+                return
+            size = SERVE_LOG_PATH.stat().st_size
+            if size <= SERVE_LOG_MAX_BYTES:
+                return
+            # Read the last SERVE_LOG_TAIL_BYTES and rewrite the file.
+            with open(SERVE_LOG_PATH, "rb") as f:
+                f.seek(-SERVE_LOG_TAIL_BYTES, os.SEEK_END)
+                tail = f.read()
+            # Drop anything before the first newline so we don't start mid-line.
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]
+            with open(SERVE_LOG_PATH, "wb") as f:
+                f.write(b"# --- serve.log pruned to last ~5 MB ---\n")
+                f.write(tail)
+        except Exception:
             pass
 
 
@@ -350,14 +510,22 @@ class ToolLogger:
 _logger: Optional[ToolLogger] = None
 
 
-def get_logger() -> ToolLogger:
+def get_logger(*, serve_log: bool = False) -> ToolLogger:
     """
     Get the global logger instance.
 
+    Args:
+        serve_log: pass True from inside ``scitoolkit serve`` to enable
+            writing tool calls and orchestrator events to ``serve.log`` in
+            addition to the daily files. The first caller to set this flag
+            wins; subsequent calls return the existing instance regardless.
+            (Serve is the only caller that should pass True, and it does so
+            once at startup.)
+
     Returns:
-        ToolLogger instance
+        ToolLogger instance (singleton)
     """
     global _logger
     if _logger is None:
-        _logger = ToolLogger()
+        _logger = ToolLogger(serve_log=serve_log)
     return _logger

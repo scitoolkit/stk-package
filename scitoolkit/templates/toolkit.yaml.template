@@ -5,16 +5,16 @@ author: Your Name
 email: your.email@example.com
 license: MIT
 homepage: https://github.com/yourusername/{{name}}
-category: general  # Options: astro, hep, quantum, neutrino, cosmology, general
+category: other  # Options: astro, hep, quantum, neutrino, bio, chem, materials, utils, other
 keywords:
   - science
   - research
-python_version: "3.11"
+python_version: "3.12"
 
 tools:
   - name: example_tool
-    function: tools.tool_example.example_tool
+    function: tools.example_tool.example_tool
     description: An example tool that demonstrates the basic Orchestral structure
   - name: text_processor
-    function: tools.tool_example.text_processor
+    function: tools.example_tool.text_processor
     description: Another example tool showing text processing

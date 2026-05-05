@@ -36,6 +36,7 @@ dependencies = [
     "pydantic>=2.0",
     "email-validator>=2.0",
     "orchestral-ai>=1.0",
+    "mcp>=1.0",
 ]
 
 [project.urls]
@@ -46,6 +47,10 @@ Issues = "https://github.com/adroman/scitoolkit/issues"
 
 [project.scripts]
 scitoolkit = "scitoolkit.cli:main"
+# `stk` is an alias for `scitoolkit` — same entrypoint, both ship every
+# pip install. Use whichever you prefer; `stk list` is identical to
+# `scitoolkit list`.
+stk = "scitoolkit.cli:main"
 
 [project.optional-dependencies]
 dev = [

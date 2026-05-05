@@ -5,10 +5,124 @@ Defines the schema for toolkit.yaml and provides validation functions
 to ensure toolkits meet the required structure and format.
 """
 
+import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator, EmailStr
 import yaml
+
+
+# Hardcoded fallback for the category whitelist when the registry is
+# unreachable. Must stay in sync with stk-website/lib/categories.ts
+# (FALLBACK_CATEGORIES). The registry is the source of truth at runtime —
+# this list is only used when the network is down or the endpoint is
+# pre-deployment.
+FALLBACK_CATEGORIES = [
+    'astro',
+    'hep',
+    'quantum',
+    'neutrino',
+    'bio',
+    'chem',
+    'materials',
+    'utils',
+    'other',
+]
+
+
+_categories_cache: Optional[List[str]] = None
+
+
+def get_allowed_categories() -> List[str]:
+    """Return the canonical category id whitelist.
+
+    Tries ``GET {API}/api/categories`` first; falls back to
+    ``FALLBACK_CATEGORIES`` on any error (network, non-200, malformed JSON,
+    timeout). Cached for the duration of a single CLI invocation to avoid
+    re-fetching across multiple validations in the same run.
+
+    Why fall back instead of failing: ``scitoolkit validate`` runs
+    pre-commit and in offline CI; the registry being down must not break
+    those flows. The backend re-validates on upload anyway.
+    """
+    global _categories_cache
+    if _categories_cache is not None:
+        return _categories_cache
+
+    api_url = os.environ.get("SCITOOLKIT_API_URL", "https://api.scitoolkit.org")
+    try:
+        # Lazy import so plain Pydantic validation (used as a library) doesn't
+        # pull in requests just to read a yaml file.
+        import requests
+        resp = requests.get(f"{api_url}/api/categories", timeout=5)
+        if resp.status_code != 200:
+            raise RuntimeError(f"status {resp.status_code}")
+        data = resp.json()
+        # Accept either {"categories": [...]} or a bare list.
+        raw = data.get("categories") if isinstance(data, dict) else data
+        if not isinstance(raw, list):
+            raise RuntimeError("unexpected response shape")
+        ids: List[str] = []
+        for item in raw:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                ids.append(item["id"])
+            elif isinstance(item, str):
+                ids.append(item)
+        if not ids:
+            raise RuntimeError("empty category list")
+        _categories_cache = ids
+        return ids
+    except Exception:
+        print(
+            "[scitoolkit] could not reach registry to verify category; "
+            "using built-in list",
+            file=sys.stderr,
+        )
+        _categories_cache = list(FALLBACK_CATEGORIES)
+        return _categories_cache
+
+
+def _check_skill_frontmatter(skill_path: Path) -> Optional[str]:
+    """Return a human-readable warning if a skill's frontmatter is missing
+    or incomplete; ``None`` if it's fine.
+
+    Claude Code's skill discovery expects YAML frontmatter at the top of
+    each ``SKILL.md`` with at least ``name`` and ``description``. We
+    warn rather than error here because (a) older toolkits predate this
+    requirement and (b) the install-time surfacer synthesizes frontmatter
+    when missing, so the toolkit still works.
+    """
+    # Lazy import; we don't want validation.py to depend on the skills
+    # module at import time (creates a circular if skills.py ever
+    # imports validation in the future).
+    try:
+        from .skills import parse_frontmatter
+    except Exception:
+        return None
+    try:
+        text = skill_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fm, _body = parse_frontmatter(text)
+    docs_url = "https://scitoolkit.org/docs/authoring#skills"
+    if fm is None:
+        return (
+            f"skills/{skill_path.name}: missing YAML frontmatter. "
+            f"Add a `---`-delimited block at the top with `name:` and "
+            f"`description:` fields. See {docs_url} for the format."
+        )
+    if not fm.is_complete():
+        missing = [
+            k for k in ("name", "description")
+            if not getattr(fm, k)
+        ]
+        return (
+            f"skills/{skill_path.name}: frontmatter missing required "
+            f"field{'s' if len(missing) != 1 else ''}: "
+            f"{', '.join(missing)}. See {docs_url} for the format."
+        )
+    return None
 
 
 class ToolDefinition(BaseModel):
@@ -38,6 +152,15 @@ class ToolkitMetadata(BaseModel):
     category: Optional[str] = Field(None, description="Category (astro, hep, quantum, etc.)")
     keywords: Optional[List[str]] = Field(default_factory=list, description="Keywords for search")
     python_version: Optional[str] = Field("3.11", description="Required Python version")
+    expected_toolkits: Optional[List[str]] = Field(
+        default_factory=list,
+        description=(
+            "Other toolkits this one is designed to work alongside. "
+            "Surfaced on install (with offer to install them too) and "
+            "rendered on the website's detail page. No runtime coupling — "
+            "each runs as its own serve subprocess; the agent picks which to call."
+        ),
+    )
     tools: List[ToolDefinition] = Field(..., description="List of tools in this toolkit")
 
     @field_validator('name')
@@ -59,6 +182,29 @@ class ToolkitMetadata(BaseModel):
             raise ValueError('Version should be in format: major.minor or major.minor.patch')
         return v
 
+    @field_validator('expected_toolkits')
+    @classmethod
+    def validate_expected_toolkits(cls, v):
+        """Each entry must be a valid toolkit name (the registry will
+        verify existence at upload time; we just check shape here)."""
+        if not v:
+            return v
+        for entry in v:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"expected_toolkits entries must be strings, got {type(entry).__name__}"
+                )
+            if not entry.replace('_', '').replace('-', '').isalnum():
+                raise ValueError(
+                    f"expected_toolkits entry '{entry}' must be alphanumeric "
+                    "(underscores and hyphens allowed)"
+                )
+            if len(entry) < 3:
+                raise ValueError(
+                    f"expected_toolkits entry '{entry}' is too short (min 3 chars)"
+                )
+        return [e.lower() for e in v]
+
     @field_validator('category')
     @classmethod
     def validate_category(cls, v):
@@ -66,16 +212,7 @@ class ToolkitMetadata(BaseModel):
         if v is None:
             return v
 
-        allowed_categories = [
-            'astro',
-            'hep',
-            'quantum-computing',
-            'neutrino',
-            'bio',
-            'chem',
-            'materials',
-            'other'
-        ]
+        allowed_categories = get_allowed_categories()
 
         if v.lower() not in allowed_categories:
             raise ValueError(f'Category must be one of: {", ".join(allowed_categories)}')
@@ -256,10 +393,23 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
             result.errors.append("skills/ exists but is not a directory")
             result.is_valid = False
         else:
-            # Check for markdown files
-            skill_files = list(skills_dir.glob('*.md'))
+            # Check for markdown files. Filter out macOS AppleDouble files.
+            skill_files = [
+                p for p in skills_dir.glob('*.md')
+                if not p.name.startswith('._')
+            ]
             if not skill_files:
                 result.warnings.append("skills/ directory exists but is empty (consider adding skill guides)")
+
+            # Frontmatter check: each skill should carry name + description
+            # at the top so Claude Code (when surfaced into ~/.claude/skills/)
+            # can index it. Warning-only — backward compat with toolkits
+            # that predate the requirement; the install-time surfacer
+            # synthesizes frontmatter when missing.
+            for sf in skill_files:
+                fm_problem = _check_skill_frontmatter(sf)
+                if fm_problem:
+                    result.warnings.append(fm_problem)
 
             # Validate skills metadata in toolkit.yaml if present
             if metadata and hasattr(metadata, 'skills') and metadata.skills:

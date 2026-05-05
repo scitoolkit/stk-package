@@ -28,6 +28,10 @@ venv/
 env/
 ENV/
 .venv
+.venv/
+test-venv/
+test-venv-*/
+*-venv/
 
 # IDE
 .vscode/
@@ -56,3 +60,18 @@ dmypy.json
 
 # Distribution / packaging
 *.whl
+
+# Ruff / linters
+.ruff_cache/
+
+# OS
+Thumbs.db
+.DS_Store?
+._*
+
+# Logs
+*.log
+logs/
+
+# Local scitoolkit state (if running CLI from repo)
+.scitoolkit/

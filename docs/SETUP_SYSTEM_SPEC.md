@@ -1,8 +1,47 @@
 # Toolkit Setup System - Specification
 
-**Status:** Draft for Phase 3B
+> **ASPIRATIONAL — Phase 3C, not yet implemented.** This spec describes the planned setup system. No code exists yet. The forward-compat hook is in place in `scitoolkit serve` (toolkits with `setup_script: true` are skipped at startup with a clear "setup not yet run" message), but `SetupContext`, `scitoolkit setup`, and the declarative `config:` block are all unimplemented. When Phase 3C lands, this banner comes off.
+
+**Status:** Approved design, awaiting Phase 3C implementation
 **Date:** 2026-04-20
+**Last revised:** 2026-05-06 (file-first model per Tony Menzo feedback)
 **Author:** Manager Agent
+
+---
+
+## Revision note (2026-05-06): file-first config
+
+The original spec was prompt-first: `setup.py` runs `ctx.prompt()` to gather values, persists them to disk. Tony Menzo (co-creator) requested a flip — many users (especially coding-agent users) don't want install-time prompts and would rather know where the config file lives so they can edit it directly.
+
+**Resolved model: config file is canonical, prompts are optional scaffolding.**
+
+- All persistent toolkit configuration lives in `~/.scitoolkit/config/<toolkit>.{json,yaml}`. This file is the single source of truth.
+- `scitoolkit install <toolkit>` drops a config-file template populated with defaults, descriptions as comments, and empty placeholders for required fields.
+- **Interactive (default):** install prompts for each required field with `(Esc to skip, edit later in <path>)` affordance. Filled-in values are written to the config file.
+- **Non-interactive (`--no-prompt`, or non-TTY context):** install skips prompts entirely, drops the template with placeholders, and prints the path. User must edit the file before serving.
+- `scitoolkit config show <toolkit>` / `edit <toolkit>` / `set <toolkit> <key> <value>` for scripted edits and discoverability.
+- `scitoolkit serve` re-reads the config on startup. If required fields are empty/missing, refuse with clear error and the file path.
+
+This honors flag-equivalence (everything the prompts do is also doable by editing the file or via `scitoolkit config set`) and the user's right to edit configuration without going through the CLI.
+
+### Standard prompt UX template
+
+```
+Installing ASTER...
+
+ASTER requires the following configuration:
+
+  api_key (required) — Your NASA Exoplanet Archive API key.
+                       For info on how to get it, see: <homepage_url>/setup
+  > _
+  (press Esc to skip for now and edit later at ~/.scitoolkit/config/aster.yaml)
+
+  opacity_path (required) — Path to opacity data files (~2.3GB)
+                            Download instructions: <homepage_url>/data
+  > _
+```
+
+Authors define these prompts via the declarative `config:` block (Tier 1) or the `setup.py` script (Tier 2).
 
 ---
 
@@ -79,6 +118,7 @@ env_vars:
 - `string` - Plain text
 - `secret` - Hidden input (for API keys)
 - `integer` - Whole number
+- `float` - Floating point number
 - `boolean` - True/false
 - `choice` - One of a fixed list
 
