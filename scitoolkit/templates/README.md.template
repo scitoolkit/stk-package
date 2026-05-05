@@ -6,12 +6,6 @@ A brief description of your toolkit.
 
 Explain what your toolkit does and what scientific domain it covers.
 
-## Installation
-
-```bash
-scitoolkit install {{name}}
-```
-
 ## Tools
 
 ### example_tool
@@ -23,68 +17,34 @@ Description of what this tool does.
 - `option` (str, optional): Description
 
 **Returns:**
-- Dictionary with results
+- JSON string with results
 
 **Example:**
 ```python
-from scitoolkit import load_toolkit
-
-toolkit = load_toolkit('{{name}}')
-result = toolkit.example_tool(42.0, option="test")
-print(result)
+result = example_tool(42.0, option="test")
+# Returns: {"status": "ok", "result": 84.0, ...}
 ```
 
-## Usage with AI Agents
+### text_processor
 
-### Claude Code
+Another example tool for text processing.
 
-```bash
-scitoolkit install {{name}}
-scitoolkit serve
-```
+**Parameters:**
+- `text` (str): Text to process
+- `uppercase` (bool, optional): Convert to uppercase (default: True)
 
-Then in your Claude Code configuration, the toolkit will be available automatically.
-
-## Development
-
-### Requirements
-
-- Python {{python_version}}+
-- Dependencies listed in requirements.txt
-
-### Local Testing
-
-```bash
-# Install in development mode
-pip install -e .
-
-# Run tests (if you add them)
-pytest
-```
+**Returns:**
+- JSON string with processed text
 
 ## Citation
 
 If you use this toolkit in your research, please cite:
 
-```
-@software{ {{name}},
+```bibtex
+@software{{{name}},
   author = {Your Name},
   title = { {{name}} },
   year = {2024},
-  url = {https://scitoolkit.org/toolkits/{{name}}}
+  url = {https://scitoolkit.org/toolkit/{{name}}}
 }
 ```
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-Contributions welcome! Please open an issue or submit a pull request.
-
-## Contact
-
-- Author: Your Name
-- Email: your.email@example.com
-- GitHub: https://github.com/yourusername/{{name}}

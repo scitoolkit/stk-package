@@ -218,51 +218,96 @@ Local Installation (~/.scitoolkit/):
 
 **Deliverable**: Complete publish workflow from CLI to website
 
-## Phase 3: Installation & Usage (Weeks 9-12)
+## Phase 3: Installation & Usage (Weeks 9-14)
 
-### 3.1 CLI Installation
+### 3A: Multi-Tier Execution (Venv + Conda) - CURRENT PHASE
+
+#### 3A.1 Multi-Tier Execution Architecture
+
+**Three execution modes with auto-detection:**
+
+1. **Venv Mode** - Isolated virtualenv per toolkit (default, fast)
+   - Pure Python toolkits
+   - Each toolkit: ~/.scitoolkit/toolkits/{name}/.venv/
+   - Subprocess execution
+
+2. **Conda Mode** - Conda environment per toolkit (different Python versions)
+   - Scientific computing with specific Python versions
+   - Conda env: scitoolkit-{name}
+   - Handles binary dependencies
+
+3. **Docker Mode** - Containers (Phase 3B, system dependencies)
+   - Legacy code, system libraries, CUDA, etc.
+   - Planned for Phase 3B
+
+**See [PLATFORM_DECISIONS.md](../PLATFORM_DECISIONS.md#8-execution-architecture---multi-tier-system-approved---phase-3) for full architectural details.**
+
+#### 3A.2 CLI Installation Commands
 
 - [ ] Implement `scitoolkit search <query>` command
   - Search registry by name/description/category
   - Display results in terminal (rich formatting)
 - [ ] Implement `scitoolkit install <name>` command
   - Download toolkit from registry
-  - Create isolated venv in ~/.scitoolkit/toolkits/<name>/
+  - Auto-detect execution mode (venv/conda/docker)
+  - Create isolated environment (~/.scitoolkit/toolkits/<name>/)
   - Install dependencies from requirements.txt
   - Extract toolkit files
   - Register toolkit locally
+  - Optional: --force-docker, --force-venv flags
 - [ ] Implement `scitoolkit list` command
   - Show installed toolkits
-  - Display versions, paths
+  - Display execution mode, versions, paths
 - [ ] Implement `scitoolkit uninstall <name>` command
+  - Remove toolkit and cleanup environment
 - [ ] Implement `scitoolkit update <name>` command
   - Check for newer versions
   - Update toolkit
 
-### 3.2 Integration with Orchestral AI
+#### 3A.3 MCP Server Implementation
 
-- [ ] Create toolkit loader module
+- [ ] Implement `scitoolkit serve` command
+  - Start STDIO MCP server
+  - Discover all installed toolkits
+  - Route tool calls to appropriate execution environment
+  - Subprocess execution for venv/conda tools
+  - Container execution for docker tools (Phase 3B)
+- [ ] Textual TUI for toolkit management
+  - Interactive list of installed toolkits
+  - Toggle toolkit on/off during serve
+  - View toolkit status, execution mode
+- [ ] Create helper for Claude Code integration
+  - Auto-configure Claude Code MCP settings
+- [ ] Document MCP usage for other agent frameworks
+
+**Deliverable**: End-to-end workflow: install → serve → use with MCP
+
+### 3B: Docker Support (Planned - Following weeks)
+
+- [ ] Create scitoolkit/python base Docker images
+  - 3.11-minimal, 3.11-scipy, 3.11-astro, etc.
+  - Push to Docker Hub
+- [ ] Implement Docker mode in install/serve
+  - Auto-generate Dockerfiles from templates
+  - Build and manage Docker images
+  - Container lifecycle management
+- [ ] Advanced features
+  - GPU support in containers
+  - Data volume mounting
+  - Health checks
+
+### 3C Integration with Orchestral AI (Ongoing)
+
+- [x] Create toolkit loader module
   ```python
   from scitoolkit import load_toolkit
   aster = load_toolkit('aster')
   tools = aster.get_tools()
   ```
-- [ ] Implement tool discovery from installed toolkits
-- [ ] Add Orchestral tool format parser
+- [x] Implement tool discovery from installed toolkits
+- [x] Support Orchestral tool format (@define_tool decorator)
 - [ ] Test with existing ASTER and HEPTAPOD toolkits
-
-### 3.3 MCP Server Integration
-
-- [ ] Implement `scitoolkit serve` command
-  - Start MCP server serving all installed toolkits
-  - Support both HTTP and STDIO transports
-  - Auto-generate MCP server config
-- [ ] Create helper for Claude Code integration
-  - `scitoolkit configure claude-code`
-  - Auto-update Claude Code's MCP config file
-- [ ] Document MCP usage for other agent frameworks
-
-**Deliverable**: End-to-end workflow: install → use in scripts → use in MCP
+- [ ] Verify MCP server tool routing
 
 ## Phase 4: Polish & Scale (Weeks 13-16)
 
@@ -390,10 +435,14 @@ Local Installation (~/.scitoolkit/):
 - Can add S3/cloud storage later if needed
 - Direct file serving via FastAPI
 
-**CLI**: Click or Typer
-- Standard Python CLI frameworks
-- Rich terminal output support
-- Easy to test
+**CLI**: Click (CLI framework) + Textual (TUI)
+- Click: Standard Python CLI framework
+  - Rich terminal output support
+  - Easy to test
+- Textual: Terminal User Interface for interactive features
+  - Interactive toolkit management in serve command
+  - Toggle toolkits on/off during serve
+  - View status and logs
 
 ## Risks & Mitigations
 

@@ -1,7 +1,7 @@
 """
 Toolkit validation using Pydantic schemas.
 
-Defines the schema for scitoolkit.yaml and provides validation functions
+Defines the schema for toolkit.yaml and provides validation functions
 to ensure toolkits meet the required structure and format.
 """
 
@@ -27,7 +27,7 @@ class ToolDefinition(BaseModel):
 
 
 class ToolkitMetadata(BaseModel):
-    """Schema for scitoolkit.yaml metadata file."""
+    """Schema for toolkit.yaml metadata file."""
     name: str = Field(..., description="Toolkit name")
     version: str = Field(..., description="Version (semantic versioning recommended)")
     description: str = Field(..., description="Brief description of the toolkit")
@@ -67,12 +67,13 @@ class ToolkitMetadata(BaseModel):
             return v
 
         allowed_categories = [
-            'astro', 'astrophysics',
-            'hep', 'high-energy-physics',
-            'quantum', 'quantum-computing',
+            'astro',
+            'hep',
+            'quantum-computing',
             'neutrino',
-            'cosmology',
-            'general',
+            'bio',
+            'chem',
+            'materials',
             'other'
         ]
 
@@ -95,7 +96,7 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
     Validate a toolkit's structure and configuration.
 
     Checks:
-    1. scitoolkit.yaml exists and is valid
+    1. toolkit.yaml exists and is valid
     2. Required files are present
     3. Tools directory exists
     4. Tool files are present
@@ -121,14 +122,30 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
         result.errors.append(f"Toolkit path is not a directory: {toolkit_path}")
         return result
 
-    # Check for scitoolkit.yaml
-    yaml_file = toolkit_path / "scitoolkit.yaml"
+    # Check for toolkit.yaml
+    yaml_file = toolkit_path / "toolkit.yaml"
     if not yaml_file.exists():
         result.is_valid = False
-        result.errors.append("Missing required file: scitoolkit.yaml")
+        result.errors.append("Missing required file: toolkit.yaml")
+
+        # Check if subdirectories contain toolkit.yaml (helpful hint)
+        subdirs_with_toolkit = []
+        try:
+            for item in toolkit_path.iterdir():
+                if item.is_dir() and (item / "toolkit.yaml").exists():
+                    subdirs_with_toolkit.append(item.name)
+        except PermissionError:
+            pass
+
+        if subdirs_with_toolkit:
+            result.warnings.append(
+                f"Found toolkit(s) in subdirectories: {', '.join(subdirs_with_toolkit)}\n"
+                f"  Hint: cd into one of these directories and run 'scitoolkit validate' again"
+            )
+
         return result
 
-    # Parse and validate scitoolkit.yaml
+    # Parse and validate toolkit.yaml
     try:
         with open(yaml_file, 'r') as f:
             yaml_data = yaml.safe_load(f)
@@ -138,12 +155,12 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
 
     except yaml.YAMLError as e:
         result.is_valid = False
-        result.errors.append(f"Invalid YAML in scitoolkit.yaml: {e}")
+        result.errors.append(f"Invalid YAML in toolkit.yaml: {e}")
         return result
 
     except Exception as e:
         result.is_valid = False
-        result.errors.append(f"Invalid scitoolkit.yaml: {e}")
+        result.errors.append(f"Invalid toolkit.yaml: {e}")
         return result
 
     # Check for required files
@@ -183,7 +200,7 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
         result.is_valid = False
         result.errors.append("Missing required directory: mcp/ (needed for MCP server)")
     else:
-        mcp_files = ['toolkit_registry.py', 'server_stdio.py', '__init__.py']
+        mcp_files = ['server_stdio.py', '__init__.py']
         for filename in mcp_files:
             file_path = mcp_dir / filename
             if not file_path.exists():
@@ -232,12 +249,40 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
         except Exception as e:
             result.warnings.append(f"Could not read requirements.txt: {e}")
 
+    # Validate skills/ directory (optional)
+    skills_dir = toolkit_path / 'skills'
+    if skills_dir.exists():
+        if not skills_dir.is_dir():
+            result.errors.append("skills/ exists but is not a directory")
+            result.is_valid = False
+        else:
+            # Check for markdown files
+            skill_files = list(skills_dir.glob('*.md'))
+            if not skill_files:
+                result.warnings.append("skills/ directory exists but is empty (consider adding skill guides)")
+
+            # Validate skills metadata in toolkit.yaml if present
+            if metadata and hasattr(metadata, 'skills') and metadata.skills:
+                for skill in metadata.skills:
+                    if isinstance(skill, dict):
+                        skill_file_path = skill.get('file', '')
+                        skill_name = skill.get('name', 'unknown')
+                    else:
+                        # If skills is just a list of strings
+                        skill_file_path = str(skill)
+                        skill_name = skill_file_path
+
+                    full_skill_path = toolkit_path / skill_file_path
+                    if not full_skill_path.exists():
+                        result.errors.append(f"Skill file referenced in toolkit.yaml not found: {skill_file_path}")
+                        result.is_valid = False
+
     return result
 
 
 def load_toolkit_metadata(toolkit_path: Path) -> Optional[ToolkitMetadata]:
     """
-    Load toolkit metadata from scitoolkit.yaml.
+    Load toolkit metadata from toolkit.yaml.
 
     Args:
         toolkit_path: Path to toolkit directory
@@ -245,7 +290,7 @@ def load_toolkit_metadata(toolkit_path: Path) -> Optional[ToolkitMetadata]:
     Returns:
         ToolkitMetadata object or None if invalid
     """
-    yaml_file = toolkit_path / "scitoolkit.yaml"
+    yaml_file = toolkit_path / "toolkit.yaml"
 
     if not yaml_file.exists():
         return None

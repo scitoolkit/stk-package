@@ -15,12 +15,14 @@ import os
 CONFIG_DIR = Path.home() / ".scitoolkit"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOOLKITS_DIR = CONFIG_DIR / "toolkits"
+LOGS_DIR = CONFIG_DIR / "logs"
 
 
 def ensure_config_dir():
     """Create configuration directory if it doesn't exist."""
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
     TOOLKITS_DIR.mkdir(exist_ok=True, parents=True)
+    LOGS_DIR.mkdir(exist_ok=True, parents=True)
 
 
 def load_config() -> Dict[str, Any]:

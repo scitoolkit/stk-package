@@ -1,7 +1,12 @@
 """MCP STDIO server for {{name}}."""
 import argparse
+import sys
+from pathlib import Path
 from orchestral.mcp import MCPServer
-from .toolkit_registry import get_tools
+
+# Add toolkit root to path
+TOOLKIT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(TOOLKIT_ROOT))
 
 
 def main():
@@ -15,24 +20,20 @@ def main():
         description="{{name}} MCP Server - {{description}}"
     )
     parser.add_argument(
-        "--groups",
-        help="Comma-separated tool groups (default: all)",
-        default="all"
-    )
-    parser.add_argument(
         "--workspace",
         help="Working directory for tool operations",
         default="."
     )
     args = parser.parse_args()
 
-    # Load tools
-    groups = args.groups.split(",")
-    tools = get_tools(*groups, base_dir=args.workspace)
+    # Load all tools from tools/__init__.py
+    # The tools module exports all toolkit tools via __all__
+    import tools
+    tools_list = [getattr(tools, name) for name in tools.__all__]
 
     # Create and run MCP server
     server = MCPServer(
-        tools=tools,
+        tools=tools_list,
         name="{{name}}",
         version="{{version}}"
     )

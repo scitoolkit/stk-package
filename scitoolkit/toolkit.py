@@ -55,7 +55,8 @@ def create_toolkit_from_template(
     author: Optional[str] = None,
     email: Optional[str] = None,
     category: str = "general",
-    python_version: str = "3.11"
+    python_version: str = "3.11",
+    registry_metadata: Optional[dict] = None
 ) -> Path:
     """
     Create a new toolkit from template.
@@ -118,10 +119,43 @@ def create_toolkit_from_template(
         'tool_list': tool_list,
     }
 
-    # Create scitoolkit.yaml
-    yaml_template = get_template_path("scitoolkit.yaml.template")
-    yaml_content = render_template(yaml_template, substitutions)
-    (toolkit_path / "scitoolkit.yaml").write_text(yaml_content)
+    # Create toolkit.yaml
+    if registry_metadata:
+        # Pre-fill from registry metadata
+        version = suggest_next_version(registry_metadata.get('latest_version', '0.1.0'))
+        keywords_yaml = format_keywords_yaml(registry_metadata.get('keywords', []))
+        homepage = registry_metadata.get('homepage') or ''
+
+        yaml_content = f"""name: {name}
+version: {version}
+category: {registry_metadata.get('category', 'other')}
+description: {registry_metadata.get('description', 'A scientific toolkit')}
+author: {registry_metadata.get('author', author or 'Your Name')}
+license: {registry_metadata.get('license', 'MIT')}
+homepage: {homepage}
+keywords:
+{keywords_yaml}
+
+tools:
+  - name: example_tool
+    function: tools.example_tool.example_tool
+    description: An example tool that demonstrates the basic Orchestral structure
+  - name: text_processor
+    function: tools.example_tool.text_processor
+    description: Another example tool showing text processing
+
+# Optional: Add your skill guides in the skills/ directory
+# skills:
+#   - name: Getting Started
+#     file: skills/getting-started.md
+#     description: Learn how to use this toolkit
+"""
+    else:
+        # Use template
+        yaml_template = get_template_path("toolkit.yaml.template")
+        yaml_content = render_template(yaml_template, substitutions)
+
+    (toolkit_path / "toolkit.yaml").write_text(yaml_content)
 
     # Create tools/__init__.py
     init_template = get_template_path("__init__.py.template")
@@ -148,15 +182,21 @@ def create_toolkit_from_template(
     mcp_init_content = render_template(mcp_init_template, substitutions)
     (mcp_dir / "__init__.py").write_text(mcp_init_content)
 
-    # Create mcp/toolkit_registry.py
-    registry_template = get_template_path("mcp/toolkit_registry.py.template")
-    registry_content = render_template(registry_template, substitutions)
-    (mcp_dir / "toolkit_registry.py").write_text(registry_content)
-
     # Create mcp/server_stdio.py
+    # Note: This now directly uses tools/__init__.py as the registry
     server_template = get_template_path("mcp/server_stdio.py.template")
     server_content = render_template(server_template, substitutions)
     (mcp_dir / "server_stdio.py").write_text(server_content)
+
+    # Create skills/ directory
+    skills_dir = toolkit_path / "skills"
+    skills_dir.mkdir(exist_ok=True)
+
+    # Create example skill file
+    example_skill_template = get_template_path("skills/example_skill.md")
+    if example_skill_template.exists():
+        example_skill_content = render_template(example_skill_template, substitutions)
+        (skills_dir / "example_skill.md").write_text(example_skill_content)
 
     # Create Dockerfile if requested
     if with_docker:
@@ -254,3 +294,42 @@ def package_toolkit(toolkit_path: Path, output_path: Optional[Path] = None) -> P
         tar.add(toolkit_path, arcname=toolkit_name)
 
     return tarball_path
+
+
+def suggest_next_version(current_version: str) -> str:
+    """
+    Suggest next patch version based on current version.
+
+    Args:
+        current_version: Current version string (e.g., "0.2.3")
+
+    Returns:
+        Next patch version (e.g., "0.2.4")
+    """
+    # Handle None or empty version
+    if not current_version:
+        return "0.1.0"
+
+    try:
+        parts = current_version.split('.')
+        if len(parts) == 3:
+            major, minor, patch = parts
+            return f"{major}.{minor}.{int(patch) + 1}"
+    except (ValueError, IndexError, AttributeError):
+        pass
+    return "0.1.0"
+
+
+def format_keywords_yaml(keywords: list) -> str:
+    """
+    Format keywords list as YAML.
+
+    Args:
+        keywords: List of keyword strings
+
+    Returns:
+        YAML-formatted string
+    """
+    if not keywords:
+        return "  - science\n  - research"
+    return "\n".join(f"  - {kw}" for kw in keywords)
