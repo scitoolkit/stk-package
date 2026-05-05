@@ -205,7 +205,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.1.0", prog_name="scitoolkit")
+@click.version_option(version="0.2.0", prog_name="scitoolkit")
 def main():
     """
     SciToolkit - Scientific agentic tools made easy
@@ -217,7 +217,10 @@ def main():
 
 @main.command()
 @click.argument('name', required=False)
-@click.option('--path', '-p', default=None, help='Directory to create toolkit in')
+@click.option(
+    '--path', '-p', default=None,
+    help='Parent directory to create the toolkit in (default: current dir).',
+)
 @click.option('--with-docker', is_flag=True, help='Include Dockerfile template')
 @_interactive_options
 def init(name, path, with_docker, yes, no_, no_input):
@@ -275,34 +278,46 @@ def init(name, path, with_docker, yes, no_, no_input):
         console.print(f"[yellow]Could not connect to registry: {e}[/yellow]")
         console.print("Creating new template...")
 
-    # Determine target path
-    target_path = Path(path) if path else Path.cwd() / name
+    # ``--path`` is the *parent directory* in which to create the new
+    # toolkit dir; the toolkit's own name is always appended. Matches
+    # how `npm create`, `cargo new`, `cookiecutter`, etc. behave —
+    # `stk init my-tk --path /tmp` produces /tmp/my-tk/, not overwrites /tmp.
+    parent_dir = Path(path) if path else Path.cwd()
+    target_path = parent_dir / name
 
     try:
-        toolkit_path = create_toolkit_from_template(
+        create_toolkit_from_template(
             name=name,
             path=target_path,
             with_docker=with_docker,
             registry_metadata=registry_metadata
         )
 
-        console.print(f"\n[bold green]✓[/bold green] Toolkit created at: [cyan]{toolkit_path}[/cyan]")
+        # Render the path the user typed (not the macOS-resolved /private/...
+        # variant). Substitute $HOME with ~ for compactness.
+        display_path = str(target_path)
+        home = str(Path.home())
+        if display_path.startswith(home):
+            display_path = "~" + display_path[len(home):]
+        console.print(
+            f"\n[bold green]✓[/bold green] Toolkit created at: [cyan]{display_path}[/cyan]"
+        )
 
         if registry_metadata:
             console.print("\n[bold]Next steps:[/bold]")
-            console.print(f"  1. cd {name}")
+            console.print(f"  1. cd {display_path}")
             console.print("  2. Add your tools in the tools/ directory")
-            console.print("  3. Run 'scitoolkit validate'")
-            console.print(f"  4. Run 'scitoolkit login {name}' with your token")
-            console.print("  5. Run 'scitoolkit publish'")
+            console.print("  3. Run [cyan]stk validate[/cyan]")
+            console.print(f"  4. Run [cyan]stk login {name}[/cyan] with your token")
+            console.print("  5. Run [cyan]stk publish[/cyan]")
         else:
             console.print("\n[bold]Next steps:[/bold]")
-            console.print(f"  1. cd {name}")
-            console.print("  2. Create toolkit on https://scitoolkit.org")
+            console.print(f"  1. cd {display_path}")
+            console.print("  2. Create the toolkit on https://scitoolkit.org")
             console.print("  3. Edit toolkit.yaml with your details")
             console.print("  4. Add your tools in the tools/ directory")
-            console.print(f"  5. Run 'scitoolkit login {name}'")
-            console.print("  6. Run 'scitoolkit validate' and then 'scitoolkit publish'")
+            console.print(f"  5. Run [cyan]stk login {name}[/cyan]")
+            console.print("  6. Run [cyan]stk validate[/cyan] and then [cyan]stk publish[/cyan]")
 
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Error creating toolkit: {e}", style="red")
@@ -427,7 +442,10 @@ def login(toolkit_name, token_flag, yes, no_, no_input):
 
 
 @main.command()
-@click.option('--dry-run', is_flag=True, help='Validate without uploading')
+@click.option(
+    '--dry-run', is_flag=True,
+    help='Validate and package, but skip auth and upload.',
+)
 @click.option(
     '--allow-version-decrease', 'allow_decrease', is_flag=True, default=False,
     help=(
@@ -438,15 +456,23 @@ def login(toolkit_name, token_flag, yes, no_, no_input):
 )
 def publish(dry_run, allow_decrease):
     """
-    Publish toolkit to SciToolkit registry.
+    Publish toolkit to the SciToolkit registry.
 
-    Packages the current directory as a tarball and uploads it to the registry.
-    Requires a valid toolkit token stored via 'scitoolkit login {toolkit_name}'.
+    Packages the current directory as a tarball and uploads it. Requires
+    a valid toolkit token stored via stk login <name>.
 
     \b
-    Example:
-        scitoolkit publish
-        scitoolkit publish --dry-run  # Test without uploading
+    Lifecycle:
+        stk validate                 # check structure
+        stk login <name>             # one-time, stores token
+        stk publish --dry-run        # local sanity check
+        stk publish                  # ship it
+
+    \b
+    Examples:
+        stk publish
+        stk publish --dry-run
+        stk publish --allow-version-decrease   # rare; emergency rollbacks
     """
     console.print("\n[bold blue]Publishing toolkit to SciToolkit registry...[/bold blue]\n")
 
@@ -2005,46 +2031,112 @@ def groups():
     pass
 
 
-@groups.command('list')
+@groups.command('list', short_help='List all configured tool groups.')
 def groups_list():
     """List all configured tool groups."""
     from .serve.config import load_serve_config
 
     cfg = load_serve_config()
     if not cfg.groups:
-        console.print("[dim]No groups defined.[/dim]")
+        console.print("[dim]No groups defined.[/dim]\n")
+        console.print("Create one combining several toolkits:")
         console.print(
-            "Create one with: [cyan]scitoolkit groups create <name> "
-            "<toolkit> [<toolkit> ...][/cyan]"
+            "  [cyan]stk groups create exoplanet-pipeline aster arxiv-search[/cyan]\n"
+        )
+        console.print("Or include several toolkits but exclude a slow tool:")
+        console.print(
+            "  [cyan]stk groups create exoplanet-pipeline aster arxiv-search "
+            "--exclude-tool aster__heavy_simulation[/cyan]\n"
+        )
+        console.print(
+            "Then serve it with: [cyan]stk serve --group exoplanet-pipeline[/cyan]"
         )
         return
     for name, g in cfg.groups.items():
         console.print(f"[bold cyan]{name}[/bold cyan]")
         console.print(f"  toolkits: {', '.join(g.toolkits) or '(none)'}")
         if g.disabled_tools:
-            console.print(f"  disables: {', '.join(g.disabled_tools)}")
+            console.print(f"  excludes: {', '.join(g.disabled_tools)}")
 
 
-@groups.command('create')
+@groups.command(
+    'create',
+    short_help='Create a new group spanning multiple toolkits.',
+)
 @click.argument('name')
 @click.argument('toolkits', nargs=-1, required=True)
-def groups_create(name, toolkits):
-    """Create a new group containing the given toolkits."""
-    from .serve.config import load_serve_config, save_serve_config, Group
+@click.option(
+    '--exclude-tool', 'exclude_tool', multiple=True, metavar='TOOLKIT__TOOL',
+    help=(
+        'Exclude a specific tool from the group (repeatable). The named '
+        'toolkit must be one of the positional toolkits above.'
+    ),
+)
+def groups_create(name, toolkits, exclude_tool):
+    """Create a new group containing the given toolkits.
+
+    \b
+    A group must contain at least two toolkits — single-toolkit invocations
+    are better expressed as `stk serve <toolkit>` directly.
+
+    \b
+    Examples:
+        stk groups create exoplanet aster arxiv-search
+        stk groups create exoplanet aster arxiv-search \\
+            --exclude-tool aster__heavy_simulation
+    """
+    from .serve.config import (
+        load_serve_config, save_serve_config, Group, _split_tool, ServeConfigError,
+    )
+
+    if len(toolkits) < 2:
+        console.print(
+            "[red]✗ A group must contain at least two toolkits.[/red]"
+        )
+        console.print(
+            f"For a single toolkit, use [cyan]stk serve {toolkits[0]}[/cyan] "
+            "directly — no group needed."
+        )
+        sys.exit(2)
 
     cfg = load_serve_config()
     if name in cfg.groups:
         console.print(f"[red]Group '{name}' already exists.[/red]")
-        console.print(f"Use [cyan]scitoolkit groups edit {name}[/cyan] to modify it.")
+        console.print(f"Use [cyan]stk groups edit[/cyan] to modify it.")
         sys.exit(1)
-    cfg.groups[name] = Group(name=name, toolkits=list(toolkits))
+
+    # Validate every --exclude-tool reference: it must be well-shaped and
+    # name a toolkit in this group.
+    toolkit_set = set(toolkits)
+    excludes: list[str] = []
+    for q in exclude_tool:
+        try:
+            tk, _t = _split_tool(q)
+        except ServeConfigError as e:
+            console.print(f"[red]✗ {e}[/red]")
+            sys.exit(2)
+        if tk not in toolkit_set:
+            console.print(
+                f"[red]✗ --exclude-tool '{q}' references '{tk}', which "
+                f"isn't in this group ({', '.join(toolkits)}).[/red]"
+            )
+            sys.exit(2)
+        excludes.append(q)
+
+    cfg.groups[name] = Group(
+        name=name, toolkits=list(toolkits), disabled_tools=excludes,
+    )
     save_serve_config(cfg)
-    console.print(f"[green]✓[/green] Created group '{name}' with {len(toolkits)} toolkit(s).")
+    extra = f", excluding {len(excludes)} tool(s)" if excludes else ""
+    console.print(
+        f"[green]✓[/green] Created group '{name}' with {len(toolkits)} "
+        f"toolkit(s){extra}."
+    )
 
 
-@groups.command('edit')
+@groups.command('edit', short_help='Open serve.yaml in $EDITOR to edit groups.')
 def groups_edit():
-    """Open the serve config in $EDITOR (groups live under `groups:`)."""
+    """Open the serve config in $EDITOR (groups live under groups:)."""
     from .serve.config import SERVE_CONFIG_PATH
 
     # Ensure the file exists so $EDITOR has something to open.
@@ -2054,7 +2146,7 @@ def groups_edit():
     click.edit(filename=str(SERVE_CONFIG_PATH))
 
 
-@groups.command('delete')
+@groups.command('delete', short_help='Delete a tool group from serve.yaml.')
 @click.argument('name')
 @_interactive_options
 def groups_delete(name, yes, no_, no_input):
@@ -2098,16 +2190,16 @@ def logs(lines, follow, show_all, raw):
     Tail the serve log.
 
     The orchestrator writes structured events and tool-call traces to
-    ~/.scitoolkit/logs/serve.log whenever ``scitoolkit serve`` is running.
+    ~/.scitoolkit/logs/serve.log whenever scitoolkit serve is running.
     This command renders that log with colors so you can watch tool calls
     fire in real time while Claude Code uses them.
 
     \b
     Examples:
-        scitoolkit logs                   # tail and follow (Ctrl-C to stop)
-        scitoolkit logs --no-follow       # last 50 lines, then exit
-        scitoolkit logs -n 200            # last 200 lines and follow
-        scitoolkit logs --all --no-follow # full log to stdout
+        stk logs                   # tail and follow (Ctrl-C to stop)
+        stk logs --no-follow       # last 50 lines, then exit
+        stk logs -n 200            # last 200 lines and follow
+        stk logs --all --no-follow # full log to stdout
     """
     from .logging.logger import SERVE_LOG_PATH
     import time

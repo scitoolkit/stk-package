@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scitoolkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A community repository for scientific agentic tools - discover, share, and use AI tools for science"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -31,9 +31,8 @@ dependencies = [
     "requests>=2.31",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "textual>=0.47.0",
-    "docker>=7.0",
     "pydantic>=2.0",
+    # Required by Pydantic's EmailStr at runtime; not imported directly.
     "email-validator>=2.0",
     "orchestral-ai>=1.0",
     "mcp>=1.0",
@@ -63,3 +62,13 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scitoolkit*"]
+
+[tool.setuptools.package-data]
+# Ship template files (non-.py) so `scitoolkit init` works on PyPI installs.
+# Without this, only .py files in scitoolkit/templates/ would land in the
+# wheel — the .md, .yaml, .txt, and Dockerfile templates would silently
+# disappear and `init` would fail with a confusing missing-file error.
+"scitoolkit" = [
+    "templates/*",
+    "templates/**/*",
+]

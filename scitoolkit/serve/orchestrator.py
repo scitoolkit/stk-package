@@ -587,14 +587,18 @@ class Orchestrator:
                 return result
             except Exception as e:
                 duration = time.monotonic() - t0
+                # Some exceptions (httpx ReadTimeout, anyio cancellations,
+                # etc.) stringify to empty. Fall back to the class name so
+                # the user gets *something* useful rather than a bare colon.
+                detail = str(e) or type(e).__name__
                 logger.log_tool_complete(
-                    tid, duration=duration, success=False, error=str(e),
+                    tid, duration=duration, success=False, error=detail,
                 )
                 # Surface the failure to the upstream MCP client (Claude
                 # Code) as an error string. MCPServer's handler turns
                 # exceptions into MCP error replies, so re-raising would
                 # also work — but returning the string is more legible.
-                return f"[scitoolkit] tool call failed: {e}"
+                return f"[scitoolkit] {upstream_name} failed after {duration:.1f}s: {detail}"
 
         return forward
 
