@@ -161,6 +161,32 @@ class ToolkitMetadata(BaseModel):
             "each runs as its own serve subprocess; the agent picks which to call."
         ),
     )
+    # ── Phase 3C: setup system ────────────────────────────────────────
+    #
+    # ``config:`` is the Tier-1 declarative block. List of mappings, one
+    # per state field a tool wants injected. We don't parse it into
+    # ``ConfigSchema`` here because doing so would create an import cycle
+    # (validation → setup → validation). Instead we keep it as a raw
+    # list and run ``setup.parse_config_block()`` against it from the
+    # validate function below.
+    config: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Tier-1 declarative config schema for this toolkit. List of "
+            "field definitions (name, type, required, etc.) describing "
+            "the values that need to be filled into "
+            "~/.scitoolkit/config/<name>.yaml before the toolkit can serve. "
+            "See docs/SETUP_SYSTEM_SPEC.md."
+        ),
+    )
+    setup_script: Optional[bool] = Field(
+        default=False,
+        description=(
+            "Set to true if the toolkit ships a setup.py at its root "
+            "(Tier-2). Currently a forward-compat marker; Tier-2 ships "
+            "in Phase 3C-2."
+        ),
+    )
     tools: List[ToolDefinition] = Field(..., description="List of tools in this toolkit")
 
     @field_validator('name')
@@ -289,6 +315,36 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
 
         metadata = ToolkitMetadata(**yaml_data)
         result.metadata = metadata
+
+        # Phase 3C-1: validate the declarative `config:` block (Tier 1).
+        # ToolkitMetadata holds it as a raw list-of-dicts to avoid an
+        # import cycle. Parse it through setup.parse_config_block now
+        # to surface authoring errors at validate / publish time rather
+        # than at install time.
+        if metadata.config:
+            try:
+                # Local import: setup → schema → pydantic chain is heavy
+                # and we only need it when a config: block is present.
+                from .setup import parse_config_block
+                parse_config_block(metadata.config)
+            except Exception as e:
+                result.is_valid = False
+                result.errors.append(
+                    f"Invalid config: block in toolkit.yaml — {e}"
+                )
+
+        # If setup_script: true, look for the file at the toolkit root.
+        # Don't fail on its absence (some authors set the flag in
+        # advance of writing the script); just warn.
+        if metadata.setup_script:
+            setup_py = toolkit_path / "setup.py"
+            if not setup_py.exists():
+                result.warnings.append(
+                    "setup_script: true is set but setup.py is missing "
+                    "from the toolkit root. The install pipeline will "
+                    "skip the Tier-2 setup runner; either drop the "
+                    "flag or add a setup.py with `def setup(ctx)`."
+                )
 
     except yaml.YAMLError as e:
         result.is_valid = False

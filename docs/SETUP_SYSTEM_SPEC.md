@@ -1,517 +1,498 @@
-# Toolkit Setup System - Specification
+# Toolkit Setup System — Specification
 
-> **ASPIRATIONAL — Phase 3C, not yet implemented.** This spec describes the planned setup system. No code exists yet. The forward-compat hook is in place in `scitoolkit serve` (toolkits with `setup_script: true` are skipped at startup with a clear "setup not yet run" message), but `SetupContext`, `scitoolkit setup`, and the declarative `config:` block are all unimplemented. When Phase 3C lands, this banner comes off.
+> **ASPIRATIONAL — Phase 3C, not yet implemented.** No code exists yet for the setup system. The forward-compat hook is in place in `scitoolkit serve` (toolkits with `setup_script: true` are skipped at startup with a clear "setup not yet run" message), but `SetupContext`, `scitoolkit setup`, and the declarative `config:` block are all unimplemented. When Phase 3C lands, this banner comes off.
 
-**Status:** Approved design, awaiting Phase 3C implementation
-**Date:** 2026-04-20
-**Last revised:** 2026-05-06 (file-first model per Tony Menzo feedback)
-**Author:** Manager Agent
+**Status:** Approved design, awaiting Phase 3C implementation.
+**Last revised:** 2026-05-06 (file-first model per Tony Menzo feedback; full rewrite).
 
 ---
 
-## Revision note (2026-05-06): file-first config
+## Why this exists
 
-The original spec was prompt-first: `setup.py` runs `ctx.prompt()` to gather values, persists them to disk. Tony Menzo (co-creator) requested a flip — many users (especially coding-agent users) don't want install-time prompts and would rather know where the config file lives so they can edit it directly.
+Many scientific toolkits need configuration that isn't bundled with the code:
 
-**Resolved model: config file is canonical, prompts are optional scaffolding.**
+- **API keys** for external services (NASA, OpenAI, journal APIs).
+- **Paths** to local data, output directories, scratch space.
+- **Large data** that can't ship with the toolkit (e.g., ASTER's ~2.3 GB opacity files).
+- **Hardware capabilities** that must be detected, not assumed (CUDA, available memory, MPI).
 
-- All persistent toolkit configuration lives in `~/.scitoolkit/config/<toolkit>.{json,yaml}`. This file is the single source of truth.
-- `scitoolkit install <toolkit>` drops a config-file template populated with defaults, descriptions as comments, and empty placeholders for required fields.
-- **Interactive (default):** install prompts for each required field with `(Esc to skip, edit later in <path>)` affordance. Filled-in values are written to the config file.
-- **Non-interactive (`--no-prompt`, or non-TTY context):** install skips prompts entirely, drops the template with placeholders, and prints the path. User must edit the file before serving.
-- `scitoolkit config show <toolkit>` / `edit <toolkit>` / `set <toolkit> <key> <value>` for scripted edits and discoverability.
-- `scitoolkit serve` re-reads the config on startup. If required fields are empty/missing, refuse with clear error and the file path.
+Today (pre-3C), there is no system. Authors hand-roll `.env` files or hardcode paths, every toolkit feels different, and stateful tools that need configuration can't ship cleanly through SciToolkit.
 
-This honors flag-equivalence (everything the prompts do is also doable by editing the file or via `scitoolkit config set`) and the user's right to edit configuration without going through the CLI.
-
-### Standard prompt UX template
-
-```
-Installing ASTER...
-
-ASTER requires the following configuration:
-
-  api_key (required) — Your NASA Exoplanet Archive API key.
-                       For info on how to get it, see: <homepage_url>/setup
-  > _
-  (press Esc to skip for now and edit later at ~/.scitoolkit/config/aster.yaml)
-
-  opacity_path (required) — Path to opacity data files (~2.3GB)
-                            Download instructions: <homepage_url>/data
-  > _
-```
-
-Authors define these prompts via the declarative `config:` block (Tier 1) or the `setup.py` script (Tier 2).
+Phase 3C standardizes this. Goal: every toolkit uses the same configuration mechanism, the user always knows where their config lives, and the same flow works whether the user is human (interactive prompts) or coding agent (file-only, no prompts).
 
 ---
 
-## Problem Statement
+## Design principles
 
-Many scientific toolkits need configuration beyond their bundled code:
+1. **Config files are canonical.** Every toolkit's persistent configuration lives at `~/.scitoolkit/config/<toolkit>.yaml`, in human-readable, hand-editable YAML. This file is the source of truth. Prompts, scripts, and CLI flags all *write to this file*; runtime *reads from this file*.
 
-- **Data files:** Large datasets that can't be bundled (e.g., ASTER's opacity files ~2.3GB)
-- **API keys:** Credentials for external services (OpenAI, NASA APIs)
-- **Paths:** Where to write outputs, where to find local data
-- **Environment variables:** System-level config the toolkit depends on
-- **Stateful tools:** Tools that need injected state (e.g., `base_directory`) not provided by the agent at runtime
+2. **Prompts are scaffolding, not the path.** Interactive prompts at install time are a convenience for users who want hand-holding. They are skippable (`--no-prompt`), automatically skipped when stdin is not a TTY, and never the only way to set a value. Anything a prompt can do, file editing can also do.
 
-Scientists should not have to learn a new system for each toolkit. The setup experience must be:
+3. **Flag-equivalence.** Every persistent state change available through prompts is also reachable via CLI commands (`scitoolkit config set <toolkit> <key> <value>`). This is non-negotiable per the project-wide flag-equivalence principle.
 
-1. **Consistent** - All toolkits look and feel the same
-2. **Simple** - Trivial cases need ~3 lines of code
-3. **Flexible** - Complex cases (ASTER) are still possible
-4. **Safe** - No config means no serving; user is warned clearly
+4. **Two tiers, one storage.** Simple toolkits use a declarative YAML schema (Tier 1). Complex toolkits add a Python script (Tier 2). Both write to the same canonical config file. The user opens it the same way regardless of which tier the toolkit uses.
+
+5. **Refuse to serve incomplete config.** A toolkit with required config that isn't filled in is skipped at serve time with a clear pointer to the file path and a one-line `scitoolkit config edit <toolkit>` suggestion. No silent fallbacks; no half-running tools.
 
 ---
 
-## Core Model
+## Core model: state vs runtime, recapped
 
-Every tool is a function with two kinds of arguments:
+Every tool input is either:
 
-```
-tool(RuntimeFields, StateFields)
-       ↑              ↑
-  Agent provides   Toolkit provides
-  (visible in MCP) (invisible to MCP)
-```
+- **Runtime input.** Decided per call by the agent. Visible in MCP schema. Examples: `query`, `star_name`, `n_results`. Lives in the function signature normally.
+- **State input.** Constant about the deployment. Hidden from MCP schema. Examples: `api_key`, `opacity_path`, `output_directory`. Declared via Orchestral's `state=[...]` decorator argument.
 
-- **RuntimeFields** are what the AI agent sees and fills in (e.g., `star_name`, `planet_params`)
-- **StateFields** are injected by SciToolkit from toolkit config (e.g., `opacity_path`, `base_directory`, `api_key`)
+The setup system is the platform's answer to **"how do `state` values get filled in?"** It captures values from the user (file or prompt) and injects them into tools at serve startup via `Agent(tool_config={...})`.
 
-MCP sees only RuntimeFields. StateFields are invisible to the protocol - SciToolkit handles them at the execution layer.
+This is the discipline that lets tool authors write code without leaking secrets to the LLM and without writing custom config-loading boilerplate.
 
 ---
 
-## Two-Tier Architecture
+## Two-tier architecture
 
-### Tier 1: Declarative (toolkit.yaml)
+### Tier 1 — declarative (`toolkit.yaml`)
 
-For simple config collection. No validation, no logic, just "ask the user for these values and save them."
+For toolkits whose config is "ask the user for these N values, save them." No logic, no validation beyond type-checking, no downloads.
 
 ```yaml
 # toolkit.yaml
+name: my-toolkit
+version: 0.1.0
+# ... other metadata ...
+
 config:
-  opacity_path:
-    type: path
-    description: "Path to opacity data files"
+  - name: api_key
+    description: "Your NASA Exoplanet Archive API key. Get one at https://example.com/keys"
+    type: secret
     required: true
 
-  max_workers:
+  - name: data_path
+    description: "Where to store downloaded papers"
+    type: path
+    default: ~/.scitoolkit/data/my-toolkit
+    required: false
+
+  - name: max_workers
+    description: "Number of parallel workers for batch operations"
     type: integer
-    description: "Number of parallel workers"
     default: 4
-
-  api_endpoint:
-    type: string
-    description: "API endpoint URL"
-    default: "https://api.example.com"
-
-env_vars:
-  required:
-    - OPENAI_API_KEY
-  optional:
-    - ANTHROPIC_API_KEY
+    required: false
 ```
 
 **Supported types:**
-- `path` - File or directory path (expanded, `~` allowed)
-- `string` - Plain text
-- `secret` - Hidden input (for API keys)
-- `integer` - Whole number
-- `float` - Floating point number
-- `boolean` - True/false
-- `choice` - One of a fixed list
 
-**What declarative does NOT do:**
-- File existence validation
+| Type | Validation | Notes |
+|---|---|---|
+| `string` | Non-empty if required | Plain text |
+| `secret` | Non-empty if required | Hidden input on prompt; never displayed in `config show` |
+| `path` | Tilde expansion, optional `must_exist` | Returns absolute Path |
+| `integer` | Optional `min`, `max` | |
+| `float` | Optional `min`, `max` | |
+| `boolean` | Y/n parsing on prompt | |
+| `choice` | Must match one of `options:` list | `options:` is required |
+
+**What Tier 1 does NOT do:**
 - File content validation (e.g., "must be .h5")
 - Downloads
-- Multi-step workflows
-- Any custom logic
+- Multi-step or conditional flows
+- Custom logic of any kind
 
 If you need any of that, use Tier 2.
 
-### Tier 2: Script (setup.py)
+### Tier 2 — script (`setup.py`)
 
-For anything non-trivial. A Python file at the toolkit root that SciToolkit calls.
+For non-trivial setup. A Python file at the toolkit root that runs in the toolkit's own venv/conda env.
 
 ```python
 # setup.py
 from scitoolkit.setup import SetupContext
 
 def setup(ctx: SetupContext) -> bool:
-    """Interactive setup. Called by: scitoolkit setup <toolkit>"""
-    # ... logic here ...
-    return True
+    """Interactive setup. Called by `scitoolkit setup <toolkit>` and at install time."""
+    # ... your logic, see SetupContext API below ...
+    return True   # or False on failure
 
 def validate(ctx: SetupContext) -> bool:
-    """Check if setup is complete. Called by: scitoolkit serve"""
-    # ... logic here ...
-    return True
+    """Quick check called by `scitoolkit serve` at startup. Should be fast (<100 ms)."""
+    return ctx.get_config('opacity_path') is not None
 ```
 
-**Activated by:**
+**Activated by adding to `toolkit.yaml`:**
+
 ```yaml
-# toolkit.yaml
 setup_script: true
 ```
 
-When `setup_script: true`, SciToolkit:
-1. Prompts for declarative config first (if any)
-2. Runs `setup.py::setup(ctx)` with context pre-loaded from declarative
-3. On `scitoolkit serve`, calls `setup.py::validate(ctx)` to check readiness
+When `setup_script: true`:
+
+1. Tier 1 (declarative `config:` block) runs first if present, populating defaults and capturing user input.
+2. `setup.py::setup(ctx)` runs after, with the declarative values already loaded into `ctx`.
+3. At every `scitoolkit serve` startup, `setup.py::validate(ctx)` is called. If it returns `False`, the toolkit is skipped with a pointer to `scitoolkit setup <toolkit>`.
+
+`setup.py` runs in the toolkit's isolated environment, so it can use any dependency the toolkit declares.
 
 ---
 
-## SetupContext API
+## Storage and runtime
 
-The `ctx` object passed to `setup()` and `validate()` is a toolbox provided by SciToolkit.
+### Where config lives
 
-### Output (print to user)
+Every toolkit's configuration lives in one file:
 
-```python
-ctx.info("Checking dependencies...")      # Blue info
-ctx.warn("This will take a while")        # Yellow warning
-ctx.error("File not found")               # Red error
-ctx.hint("Try: scitoolkit setup aster")   # Dim hint
-ctx.success("All set!")                   # Green success
+```
+~/.scitoolkit/config/<toolkit>.yaml
 ```
 
-All output uses consistent styling (Rich-based). Authors don't import Rich themselves.
+Format example (after a hypothetical install):
 
-### Input (prompt user)
+```yaml
+# ASTER toolkit configuration
+# This file is canonical. Edit anytime; changes apply on next `scitoolkit serve`.
+# Auto-generated 2026-05-06; safe to hand-edit.
+
+api_key: <your-key-here>            # secret, masked in `scitoolkit config show`
+data_path: /home/alex/aster-data
+max_workers: 4
+opacity_path: /data/opacity         # set by setup.py during install
+use_gpu: true                       # set by setup.py during install
+```
+
+The file:
+- Has comments preserved across edits.
+- Is human-readable and hand-editable. Users can open it in any editor at any time.
+- Has mode `0600` (user-readable only) because it may contain secrets.
+- Is loaded fresh at every `scitoolkit serve` startup. No caching.
+
+### How values reach tools
+
+At serve startup:
+
+1. For each enabled toolkit, the orchestrator reads `~/.scitoolkit/config/<toolkit>.yaml`.
+2. For each tool decorated with `@define_tool(state=[...])`, the orchestrator builds a `tool_config` dict mapping each state field name to its config value.
+3. The orchestrator passes this dict to the toolkit subprocess via `Agent(tool_config={tool_name: {state_name: value, ...}})`.
+4. Orchestral injects state values when the agent calls the tool. Values arrive in the function signature alongside runtime args from the LLM.
+
+Authors don't need to call any helper. The `state=[...]` declaration on the decorator is enough; values appear as ordinary parameters.
 
 ```python
-# Simple string prompt
-name = ctx.prompt("Enter toolkit name:")
-name = ctx.prompt("Enter name:", default="aster")
+@define_tool(state=["api_key", "data_path"])
+def search_papers(query: str, max_results: int = 10, *,
+                  api_key: str, data_path: str) -> str:
+    # api_key and data_path are injected from ~/.scitoolkit/config/my-toolkit.yaml
+    # query and max_results come from the LLM
+    ...
+```
 
-# Typed prompts (with auto-validation)
-path = ctx.prompt_path("Data path:")              # Expands ~, returns Path
-path = ctx.prompt_path("Data path:", must_exist=True)  # Errors if missing
+If a state field is declared in `state=[...]` but missing from the config file (and required), the toolkit refuses to serve at startup.
+
+---
+
+## User-facing CLI surface
+
+### `scitoolkit install <toolkit>`
+
+The install flow integrates with setup as follows:
+
+**TTY (default):**
+
+```
+Installing ASTER 1.0.0...
+  Downloaded
+  Environment created (venv, Python 3.12)
+  Dependencies installed
+
+ASTER requires the following configuration:
+
+  api_key (required) — Your NASA Exoplanet Archive API key.
+                       For info on how to get it, see: https://example.com/aster
+  > <user types here, or presses Esc>
+  (press Esc to skip and edit later at ~/.scitoolkit/config/aster.yaml)
+
+  opacity_path (required) — Path to opacity data files (~2.3 GB)
+                            Setup script will offer to download.
+  > <captured by Tier 2 setup.py if applicable>
+```
+
+If the user presses Esc on any prompt, install completes and the config file is dropped with a placeholder (`<NEEDS VALUE>`) for that field. `scitoolkit serve` will refuse to serve that toolkit until it's filled in.
+
+**Non-TTY (`--no-prompt`, or stdin not a TTY):**
+
+```
+Installing ASTER 1.0.0...
+  Downloaded
+  Environment created
+  Dependencies installed
+
+ASTER requires configuration. No prompts shown (non-interactive context).
+Config file written: ~/.scitoolkit/config/aster.yaml
+
+Required fields needing values:
+  - api_key (secret) — Your NASA Exoplanet Archive API key
+  - opacity_path (path) — Path to opacity data files
+
+Edit the file or run: scitoolkit config set aster <key> <value>
+```
+
+Install always succeeds in both modes. Configuration is the user's next step.
+
+### `scitoolkit setup <toolkit>`
+
+Runs Tier 2's `setup.py::setup(ctx)` if present. Used to:
+- Re-run setup after install (e.g., new credentials needed).
+- Run setup that was skipped during install (`--no-prompt` mode).
+- Trigger setup-script logic like data downloads.
+
+Flags:
+- `--reset` — clear current config and start fresh.
+- `--check` — run `validate(ctx)` only, no prompts. Useful for diagnosing why a toolkit refuses to serve.
+
+### `scitoolkit config <toolkit> ...`
+
+File-canonical config management.
+
+```
+scitoolkit config show <toolkit>             # print config (secrets masked)
+scitoolkit config edit <toolkit>             # opens file in $EDITOR
+scitoolkit config path <toolkit>             # prints absolute file path
+scitoolkit config set <toolkit> <key> <value>    # mutate one field
+scitoolkit config unset <toolkit> <key>      # remove a field
+scitoolkit config validate <toolkit>         # check required fields are present, types correct
+```
+
+`config set` is the flag-equivalent path for the prompt UX. Anything a prompt does, `config set` can do without an interactive session.
+
+### `scitoolkit serve`
+
+At startup, for each enabled toolkit:
+
+1. Read `~/.scitoolkit/config/<toolkit>.yaml`.
+2. Validate required fields against the toolkit's `config:` schema and (if Tier 2) `validate(ctx)`.
+3. If invalid, skip the toolkit with a clear message:
+
+```
+Checking toolkits...
+  arxiv-search: ready (2 tools)
+  aster: skipped — required config missing
+    Missing: api_key, opacity_path
+    Edit: ~/.scitoolkit/config/aster.yaml
+    Or run: scitoolkit setup aster
+
+Starting MCP server with 1 toolkit (2 tools).
+```
+
+4. Continue serving the rest. A misconfigured toolkit never crashes the orchestrator.
+
+---
+
+## SetupContext API (Tier 2)
+
+The `ctx: SetupContext` object is the interface between `setup.py` and the platform.
+
+### Output (styled, no emojis)
+
+```python
+ctx.info("Checking dependencies...")
+ctx.warn("CUDA not detected; falling back to CPU mode")
+ctx.error("Could not reach download server")
+ctx.hint("Try setting HTTP_PROXY or running on a different network")
+ctx.success("Setup complete")
+```
+
+All output uses Rich text styling (consistent with the rest of the CLI). Authors don't import Rich themselves. No emojis (per the project-wide rule).
+
+### Input prompts
+
+```python
+# Plain string
+name = ctx.prompt("Enter project name:")
+name = ctx.prompt("Enter project name:", default="my-project")
+
+# Typed
+path = ctx.prompt_path("Data directory:")                    # tilde expanded, returns Path
+path = ctx.prompt_path("Data directory:", must_exist=True)
 port = ctx.prompt_int("Port number:", default=8080)
-count = ctx.prompt_int("Count:", min=1, max=100)
+n = ctx.prompt_int("Worker count:", min=1, max=64)
+score = ctx.prompt_float("Score threshold:", default=0.95)
 
-# Secrets (hidden input)
+# Secrets (masked input)
 key = ctx.prompt_secret("API key:")
 
 # Yes/no
-proceed = ctx.confirm("Download 2.3GB of data?", default=False)
+go = ctx.confirm("Download 2.3 GB of data?", default=False)
 
-# Menu choice
+# Menu
 choice = ctx.choice(
     "How would you like to proceed?",
     [
-        ("download", "Download automatically (~2.3GB)"),
-        ("path", "I have the data, let me provide the path"),
-        ("cancel", "Cancel setup"),
-    ]
+        ("download", "Download automatically (~2.3 GB)"),
+        ("path", "I have the data; let me provide the path"),
+        ("skip", "Skip for now"),
+    ],
 )
-# Returns the key: "download", "path", or "cancel"
+# Returns "download", "path", or "skip"
 ```
 
-### Config (read/write toolkit config)
+All prompts honor the `--no-prompt` / non-TTY contract: in non-interactive mode, prompts return their `default` if specified, or skip and write `<NEEDS VALUE>` to the config file otherwise. They never block on user input.
+
+### Config (read/write to the canonical YAML file)
 
 ```python
-# Read current config (from .env file)
-path = ctx.get_config('opacity_path')
-path = ctx.get_config('opacity_path', default='~/.aster/opacity')
+# Read
+v = ctx.get_config('api_key')
+v = ctx.get_config('max_workers', default=4)
+all_config = ctx.config                  # dict-like
 
-# Write config (auto-saves to .env)
+# Write (immediately persisted to ~/.scitoolkit/config/<toolkit>.yaml)
 ctx.set_config('opacity_path', '/data/opacity')
 ctx.set_config('use_gpu', True)
-
-# Bulk access
-all_config = ctx.config   # Dict-like access
 ```
+
+Writes preserve YAML comments and ordering. Authors never have to think about file format or encoding.
 
 ### Downloads
 
 ```python
-# Download a file with progress bar
 ctx.download(
-    url="https://data.scitoolkit.org/aster/opacity.tar.gz",
-    destination=Path.home() / '.aster' / 'opacity',
+    url="https://data.scitoolkit.org/aster/opacity-1.0.tar.gz",
+    destination=ctx.data_dir / "opacity",   # standard data path
     description="Downloading opacity data",
-    size_hint="2.3GB",        # For progress display
-    extract=True,             # Auto-extract .tar.gz, .zip
-    sha256="abc123..."        # Optional checksum verification
+    size_hint="2.3 GB",                     # for progress display
+    extract=True,                           # auto-handle .tar.gz, .zip, .tar
+    sha256="abc123def456...",               # optional checksum verification
 )
 ```
 
-### Paths
+Progress bar via Rich. SHA256 verification on completion if provided. Resumable on retry.
+
+### Standard paths
 
 ```python
-# Well-known paths
-ctx.toolkit_path          # Path to extracted toolkit
-ctx.data_dir              # ~/.scitoolkit/data/<toolkit_name>/ (auto-created)
-ctx.cache_dir             # ~/.scitoolkit/cache/<toolkit_name>/
+ctx.toolkit_path           # the extracted toolkit directory (read-only from setup.py's POV)
+ctx.data_dir               # ~/.scitoolkit/data/<toolkit>/  (auto-created, persistent)
+ctx.cache_dir              # ~/.scitoolkit/cache/<toolkit>/ (auto-created, OK to delete)
+ctx.config_path            # absolute path to ~/.scitoolkit/config/<toolkit>.yaml
 ```
 
 ### Raw Python
 
-SetupContext is not a walled garden. Authors can drop to raw Python at any time:
+`SetupContext` is a toolbox, not a sandbox. Authors can drop to raw Python whenever:
 
 ```python
 def setup(ctx):
-    # Use subprocess, requests, any library
     import subprocess
     result = subprocess.run(['nvcc', '--version'], capture_output=True)
-
-    if result.returncode == 0:
-        ctx.success("CUDA detected")
-        ctx.set_config('use_gpu', True)
-    else:
-        ctx.warn("CUDA not found, using CPU mode")
-        ctx.set_config('use_gpu', False)
-
+    ctx.set_config('use_gpu', result.returncode == 0)
     return True
 ```
 
----
-
-## Runtime: How StateFields Reach Tools
-
-### Storage
-
-After setup, config is stored in:
-```
-~/.scitoolkit/toolkits/<toolkit_name>/.env
-```
-
-### Execution Flow
-
-When `scitoolkit serve` invokes a tool:
-
-1. Load `.env` for the toolkit
-2. Validate required values exist (call `setup.py::validate()` if present)
-3. Construct subprocess environment:
-   - User's env vars (inherited)
-   - Toolkit's `.env` contents
-   - Bundled as `SCITOOLKIT_CONFIG` JSON var
-4. Run tool in subprocess with this environment
-
-### Tool Code
-
-Tools access StateFields via a helper:
-
-```python
-from orchestral import define_tool
-from scitoolkit.runtime import get_config
-import json
-
-@define_tool
-def run_forward_model(planet_params: dict) -> str:
-    """
-    Run ASTER forward model.
-
-    Args:
-        planet_params: Planet parameters (radius, mass, period)
-    """
-    # RuntimeField: planet_params (from agent)
-    # StateFields: from config
-    opacity_path = get_config('opacity_path')
-    base_dir = get_config('base_directory')
-    max_workers = get_config('max_workers', default=4)
-
-    result = aster_model(
-        planet_params,
-        opacity_path=opacity_path,
-        output_dir=base_dir,
-        n_workers=max_workers
-    )
-    return json.dumps(result)
-```
-
-The tool signature only contains RuntimeFields. StateFields come from `get_config()`.
+Standard caveats apply: `setup.py` runs in the toolkit's isolated environment, has access to its declared dependencies, and runs as the user. Don't do anything you wouldn't trust a toolkit author to do — but that's a curation question, not a sandbox question.
 
 ---
 
-## User-Facing Commands
+## Error handling
 
-### `scitoolkit install <toolkit>`
+1. **Never let one toolkit break the server.** `serve` skips invalid toolkits and logs the reason; other toolkits keep working.
 
-Normal install + setup detection.
+2. **Every error has a fix-it line.** Format:
+   ```
+   aster: skipped — opacity_path does not exist on disk
+     Run: scitoolkit setup aster
+   ```
 
-```
-📥 Installing toolkit: aster
-✓ Downloaded and extracted
-✓ Environment created (venv, Python 3.12)
-✓ Dependencies installed
+3. **`setup.py` exceptions are caught, summarized, and logged.** Show the user a one-line description and a path to the full traceback log:
+   ```
+   aster setup failed: connection refused while contacting download server
+   Full log: ~/.scitoolkit/logs/setup-aster-2026-05-06.log
+   ```
 
-⚠️  ASTER requires additional setup
-
-Required configuration:
-  • opacity_path (path to opacity data)
-  • max_workers (default: 4)
-
-Run: scitoolkit setup aster
-```
-
-### `scitoolkit setup <toolkit>`
-
-Runs interactive setup.
-
-```
-ASTER Setup
-───────────
-
-1. opacity_path: Path to opacity data files
-   [no current value]
-
-How would you like to proceed?
-  [1] Download automatically (~2.3GB)
-  [2] I have the data - let me provide the path
-  [3] Skip for now
-
-Choice: 1
-
-Downloading opacity data...
-[████████████████] 2.3GB / 2.3GB (12.5 MB/s)
-✓ Extracted to ~/.scitoolkit/data/aster/opacity
-
-✓ Found 47 opacity files
-
-2. max_workers (default: 4): [press Enter for default]
-
-✅ ASTER setup complete!
-
-Run: scitoolkit serve
-```
-
-### `scitoolkit setup <toolkit> --reset`
-
-Clears current config and re-runs setup.
-
-### `scitoolkit setup <toolkit> --check`
-
-Validates current config without re-running setup. Useful for debugging.
-
-### `scitoolkit serve`
-
-Skips toolkits whose validate() returns False:
-
-```
-Checking toolkits...
-  ✓ simple-api: Ready (3 tools)
-  ✗ aster: Setup incomplete
-      └─ opacity_path does not contain .h5 files
-      └─ Run: scitoolkit setup aster
-
-Starting MCP server with 1 toolkit (3 tools)...
-```
+4. **Partial setup is valid.** Optional fields can be skipped. Required fields refuse-to-serve until filled. Users can fill them via prompt re-run, file edit, or `config set` — three paths to the same destination.
 
 ---
 
-## Error Handling Principles
+## Security
 
-1. **Never let a broken toolkit break the server.** `serve` skips invalid toolkits rather than crashing.
-
-2. **Always tell the user what to do next.** Every error must have a hint:
-   ```
-   ✗ opacity_path does not exist
-     Hint: Run `scitoolkit setup aster` to configure
-   ```
-
-3. **`setup.py` errors are caught and shown nicely.** A traceback from setup.py should be logged but not scare the user. Show:
-   ```
-   ✗ Setup failed: Could not reach download server
-
-   Technical details logged to ~/.scitoolkit/logs/setup-aster-2026-04-20.log
-   ```
-
-4. **Partial setup is valid.** User can skip optional fields, come back later with `scitoolkit setup <toolkit>`.
-
----
-
-## Security Considerations
-
-### setup.py Executes Code
-
-`setup.py` runs arbitrary Python. This is reviewed during manual curation.
+### `setup.py` runs arbitrary code
 
 Mitigations:
-- Manual review before publication (Phase 1-3)
-- Future: automated scanning (Bandit)
-- setup.py runs in toolkit's isolated env (venv/conda/docker), not system Python
-- SetupContext provides safe defaults (downloads verify SHA256, prompts sanitize input)
+- Runs inside the toolkit's isolated venv/conda env, not system Python.
+- Curation gate: per the project-wide review policy, automated review (Bandit + Safety + LLM) catches obvious abuse pre-publish; post-hoc takedown handles the rest.
+- `SetupContext` provides safe defaults: downloads verify SHA256 if provided, file paths are sanitized.
 
-### Config Storage
+### Config storage
 
-`.env` files are plain text in `~/.scitoolkit/toolkits/<name>/.env`.
+- Files are mode `0600` (user-readable only).
+- `secret` type fields are masked in `scitoolkit config show` output.
+- `secret` type fields are never displayed in normal CLI output (never in `list`, never in error messages).
+- Values are passed to subprocesses via env or stdin, never via command-line args (avoids shell-history leakage).
 
-- User's responsibility to protect `~/.scitoolkit/`
-- `secret` type config is never logged or displayed after entry
-- `scitoolkit list` does not show secret values
+### Subprocess injection
 
-### Subprocess Injection
-
-StateFields are passed via env vars to the subprocess, not via command-line args (prevents accidental shell injection).
+State values reach tool subprocesses via the orchestrator's `Agent(tool_config=...)` pathway, not by string-interpolation into shell commands. There is no path from a config value to shell execution unless the toolkit's own code creates one.
 
 ---
 
-## Implementation Tasks
+## Implementation outline
 
-### Phase 3A-setup (after install command stabilizes)
+### Module layout
 
-1. **scitoolkit/setup/__init__.py** - SetupContext class
-2. **scitoolkit/setup/declarative.py** - YAML-based config collection
-3. **scitoolkit/setup/runner.py** - Invokes setup.py in toolkit env
-4. **scitoolkit/runtime.py** - `get_config()` helper
-5. **cli.py** - `setup` command (interactive + `--reset`, `--check`)
-6. **cli.py** - Update `install` to detect setup requirement
-7. **cli.py** - Update `serve` to call `validate()` before serving
-8. **Templates** - Update `scitoolkit init` to scaffold setup.py
+```
+scitoolkit/
+├── setup/
+│   ├── __init__.py          # public: SetupContext, run_setup, validate_setup
+│   ├── context.py           # SetupContext class
+│   ├── declarative.py       # Tier 1: parses config: block from toolkit.yaml, runs prompts
+│   ├── runner.py            # Tier 2: invokes setup.py / validate() in toolkit subprocess
+│   ├── storage.py           # YAML read/write to ~/.scitoolkit/config/<toolkit>.yaml
+│   ├── prompts.py           # TTY-aware prompt helpers (Rich-based, --no-prompt-honoring)
+│   └── downloads.py         # SHA256-verified, progress-bar-equipped download helper
+├── runtime.py               # not needed; tools receive state via Orchestral's Agent(tool_config=...)
+├── cli.py                   # adds `setup`, `config show/edit/path/set/unset/validate` subcommands
+└── serve/
+    └── orchestrator.py      # reads config files, validates, populates Agent(tool_config=...)
+```
 
-### Phase 3B-setup (polish)
+### Phase 3C-1 (the MVP of the setup system)
 
-1. Progress bars for downloads
-2. SHA256 verification
-3. Auto-extract tarballs/zips
-4. `--reset` and `--check` flags
-5. Setup logging to `~/.scitoolkit/logs/`
+1. `~/.scitoolkit/config/<toolkit>.yaml` storage layer (read/write, comment-preserving, 0600).
+2. Tier 1 declarative parser + interactive prompt runner.
+3. `scitoolkit config show/edit/path/set/unset/validate` subcommands.
+4. `scitoolkit install` integration: runs Tier 1 on TTY, drops template on `--no-prompt`/non-TTY.
+5. `scitoolkit serve` integration: reads config files, populates `Agent(tool_config=...)`, refuses to serve on missing required fields.
+6. Tests for every prompt mode (TTY, --no-prompt, non-TTY) and every type (string, secret, path, int, float, bool, choice).
 
----
+### Phase 3C-2 (Tier 2 — `setup.py`)
 
-## Adoption Strategy
+1. `SetupContext` class with the full API described above.
+2. `setup.py::setup(ctx)` runner — invokes the script in the toolkit's subprocess.
+3. `setup.py::validate(ctx)` runner — fast check at serve startup.
+4. `scitoolkit setup <toolkit>` command (with `--reset`, `--check` flags).
+5. Download helper with progress + SHA256.
+6. Tests against a synthetic toolkit with a real `setup.py`.
 
-The system's flexibility is only valuable if authors actually use it. Key tactics:
+### Phase 3C-3 (polish)
 
-1. **`scitoolkit init` creates working setup.py template** with comments
-2. **Recipes doc** (separate file) shows copy-paste solutions
-3. **ASTER is the flagship example** - its setup.py is the reference
-4. **Lint warnings** - `scitoolkit validate` flags anti-patterns:
-   - `input()` calls → "Use ctx.prompt() for consistent styling"
-   - Direct `.env` writes → "Use ctx.set_config() instead"
-   - Hardcoded paths → "Consider making this configurable"
-
-See [SETUP_RECIPES.md](SETUP_RECIPES.md) for the recipes guide.
-
----
-
-## Open Questions
-
-1. **Should `setup.py` run in toolkit's isolated env or scitoolkit's env?**
-   - Isolated: toolkit can import its own deps during setup
-   - scitoolkit env: safer but limited
-   - **Tentative decision:** Isolated (toolkit env). Some setups need toolkit-specific libs (e.g., ASTER's opacity downloader might use astropy).
-
-2. **How do we handle updates to config schema across toolkit versions?**
-   - If `aster 1.0` needs `opacity_path` and `aster 2.0` also needs `cache_dir`, what happens on upgrade?
-   - **Tentative decision:** On install over existing, preserve old config, prompt for new fields only.
-
-3. **Should config be sharable across machines?**
-   - Users may want to export/import config (e.g., lab workstation → laptop)
-   - **Tentative decision:** Defer. `scitoolkit setup <toolkit> --from-file config.env` could be added later.
-
-4. **What about multi-profile support?**
-   - User wants "dev" and "prod" ASTER configs
-   - **Tentative decision:** Out of scope for MVP.
+1. `scitoolkit init` template includes a sample `config:` block and an optional `setup.py` template.
+2. Documentation update on scitoolkit.org/docs/configuration and /docs/recipes.
+3. Migration helper for the live `arxiv-search` toolkit (it has no config today; this just verifies that no-config toolkits keep working).
 
 ---
 
-## See Also
+## What this isn't
 
-- [SETUP_RECIPES.md](SETUP_RECIPES.md) - Copy-paste examples for common patterns
-- [TOOLKIT_FORMAT_GUIDE.md](../../TOOLKIT_FORMAT_GUIDE.md) - Overall toolkit structure
-- [PLATFORM_DECISIONS.md](../../PLATFORM_DECISIONS.md) - Architectural decisions
+- **Not a permission system.** Anyone with a config file has read access. Multi-user / multi-tenant toolkits are out of scope.
+- **Not a secret manager.** Files are 0600 plain text. Users wanting integration with macOS Keychain, 1Password, etc. are out of scope for v1.
+- **Not a package manager.** Setup runs once after install. Cron-like scheduled config updates are out of scope.
+- **Not a UI / GUI.** Editing happens in the user's `$EDITOR` or via `config set`. No web UI for individual toolkit configs (the website doesn't and won't store user config — that lives on the user's machine).
+
+---
+
+## Success criteria
+
+When this lands:
+
+1. ASTER ports cleanly. The opacity-data download step runs through `setup.py`. The user goes from `scitoolkit install aster` to a fully working tool with one prompt session or one file edit.
+2. A coding agent running `scitoolkit install aster --no-prompt` always succeeds; it can fill in the config file directly afterward.
+3. Every state-bearing toolkit on the registry uses this system. No toolkit hand-rolls its own config flow.
+4. `scitoolkit serve` is robust: a misconfigured toolkit gets skipped, the rest serve, the error message tells the user exactly what to do.
+5. The user always knows where their config is. `~/.scitoolkit/config/<name>.yaml` is the answer to every "where is X stored?" question.

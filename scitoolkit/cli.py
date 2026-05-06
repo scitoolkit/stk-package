@@ -11,11 +11,13 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+import os
 import sys
 import subprocess
 import json
 from pathlib import Path
 from datetime import datetime
+from typing import List, Optional, Tuple
 import yaml
 import tarfile
 import tempfile
@@ -167,11 +169,15 @@ class _SectionedGroup(click.Group):
     COMMAND_SECTIONS = [
         (
             "Authoring & publishing",
-            ["init", "validate", "login", "publish"],
+            ["init", "validate", "login", "logout", "whoami", "publish"],
         ),
         (
             "Installing & serving",
             ["search", "install", "uninstall", "list", "serve", "logs", "groups"],
+        ),
+        (
+            "Configuration",
+            ["config", "setup"],
         ),
     ]
 
@@ -205,7 +211,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.2.0", prog_name="scitoolkit")
+@click.version_option(version="0.3.0", prog_name="scitoolkit")
 def main():
     """
     SciToolkit - Scientific agentic tools made easy
@@ -222,8 +228,17 @@ def main():
     help='Parent directory to create the toolkit in (default: current dir).',
 )
 @click.option('--with-docker', is_flag=True, help='Include Dockerfile template')
+@click.option(
+    '--with-setup', is_flag=True,
+    help=(
+        'Include Tier-2 setup.py template (and flip setup_script: true '
+        'in toolkit.yaml). Use when your toolkit needs interactive setup '
+        'beyond the declarative config: block — downloads, hardware '
+        'detection, multi-step flows.'
+    ),
+)
 @_interactive_options
-def init(name, path, with_docker, yes, no_, no_input):
+def init(name, path, with_docker, with_setup, yes, no_, no_input):
     """
     Initialize a new toolkit from template.
 
@@ -231,16 +246,18 @@ def init(name, path, with_docker, yes, no_, no_input):
     Otherwise, creates a fresh template.
 
     Creates a new toolkit directory with the standard structure:
-    - toolkit.yaml (metadata)
+    - toolkit.yaml (metadata; commented-out config: block to uncomment)
     - tools/ (tool definitions)
     - skills/ (skill guides)
     - requirements.txt (dependencies)
     - README.md (documentation)
     - Dockerfile (optional, if --with-docker is used)
+    - setup.py (optional, if --with-setup is used)
 
     Example:
         scitoolkit init my-awesome-toolkit
         scitoolkit init my-toolkit --with-docker
+        scitoolkit init my-toolkit --with-setup     # for Tier-2 setup
     """
     from .toolkit import create_toolkit_from_template
     import requests
@@ -290,6 +307,7 @@ def init(name, path, with_docker, yes, no_, no_input):
             name=name,
             path=target_path,
             with_docker=with_docker,
+            with_setup=with_setup,
             registry_metadata=registry_metadata
         )
 
@@ -385,60 +403,823 @@ def validate(path):
 
 
 @main.command()
-@click.argument('toolkit_name')
+@click.argument('toolkit_name', required=False)
 @click.option(
     '--token', 'token_flag', default=None,
-    help='Provide the publish token non-interactively (for agents and CI).',
+    help=(
+        'Provide the token non-interactively. With no toolkit argument, '
+        'expects a per-user token (sct_user_...). With a toolkit argument, '
+        'expects a legacy per-toolkit token (stk_... or toolkit_...).'
+    ),
 )
 @_interactive_options
 def login(toolkit_name, token_flag, yes, no_, no_input):
     """
-    Authenticate for publishing a specific toolkit.
-
-    Prompts for the toolkit's publish token and stores it securely.
-    Get your toolkit token from https://scitoolkit.org after creating the toolkit.
+    Authenticate to the SciToolkit registry.
 
     \b
-    Example:
-        scitoolkit login my-toolkit
-        scitoolkit login my-toolkit --token toolkit_abc...
+    Modes:
+        scitoolkit login                          # browser-flow (recommended)
+        scitoolkit login --token sct_user_...     # paste a per-user token
+        scitoolkit login <toolkit>                # legacy per-toolkit (deprecated)
+        scitoolkit login <toolkit> --token stk_... # legacy paste mode
+
+    The browser-flow opens https://scitoolkit.org/cli-auth, asks you to
+    approve, and writes the resulting per-user token to ~/.scitoolkit/token.
+    Once logged in, stk publish works for any toolkit you have
+    permission on — no per-toolkit login required.
+
+    Per-toolkit tokens are still accepted but deprecated; use the
+    browser-flow form for new setups.
     """
+    from . import auth
+
     mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    # ── Branch 1: legacy per-toolkit form (`scitoolkit login <name>`) ─
+    if toolkit_name:
+        _login_legacy_toolkit(toolkit_name, token_flag, mode)
+        return
+
+    # ── Branch 2: per-user paste mode (`scitoolkit login --token ...`) ─
+    if token_flag is not None:
+        _login_paste_user_token(token_flag, mode)
+        return
+
+    # ── Branch 3: no toolkit + no token → browser-flow with migration ─
+    legacy_files = auth.find_legacy_token_files()
+    if legacy_files:
+        _login_run_migration_prompt(legacy_files, mode)
+
+    _login_browser_flow(mode)
+
+
+def _login_legacy_toolkit(toolkit_name: str, token_flag: Optional[str], mode: str) -> None:
+    """Old `scitoolkit login <toolkit>` flow. Writes ~/.scitoolkit/<name>/token.
+
+    Per the per-user-token migration, this path is deprecated and prints
+    a one-line warning. Kept working through Phase B (~30 days) so CI
+    pipelines and existing workflows don't break.
+    """
+    from . import auth
 
     if token_flag is not None:
         token = token_flag
     else:
         if mode != "skip":
-            console.print(f"\n[bold blue]Authenticating for toolkit: {toolkit_name}[/bold blue]\n")
-            console.print("Get your toolkit token from: [link]https://scitoolkit.org[/link]")
-            console.print(f"(Create the toolkit '{toolkit_name}' first, then copy its publish token)\n")
+            console.print(
+                f"\n[bold blue]Authenticating for toolkit: {toolkit_name}[/bold blue]\n"
+            )
+            console.print(
+                "Per-toolkit tokens are deprecated. The recommended flow "
+                "is [cyan]scitoolkit login[/cyan] (no toolkit argument)."
+            )
+            console.print(
+                "Get a per-toolkit token from "
+                "[link]https://scitoolkit.org[/link] (the toolkit's "
+                "management page) if you still need one.\n"
+            )
         token = _require_input(
-            "Enter your toolkit token",
+            "Enter the publish token",
             mode=mode,
             bypass_flag="--token",
             hide_input=True,
         )
 
-    if not token.startswith('toolkit_'):
-        console.print("[yellow]Warning: token should start with 'toolkit_'[/yellow]")
-        if not _confirm("Continue anyway?", default=True, mode=mode):
+    token = token.strip()
+    if not auth.is_legacy_toolkit_token(token):
+        console.print(
+            "[yellow]Warning: legacy per-toolkit tokens normally start with "
+            "[bold]stk_[/bold] or [bold]toolkit_[/bold]. The token you provided "
+            "doesn't match either prefix.[/yellow]"
+        )
+        if auth.is_user_token(token):
+            console.print(
+                "It looks like you pasted a per-user token "
+                "([bold]sct_user_...[/bold]) into the legacy form. Use "
+                "[cyan]scitoolkit login --token <token>[/cyan] (no toolkit "
+                "argument) instead."
+            )
+            sys.exit(1)
+        if not _confirm("Continue anyway?", default=False, mode=mode, consequential=True):
             sys.exit(0)
 
-    # Create directory for this toolkit
-    from .config import CONFIG_DIR
-    config_dir = CONFIG_DIR / toolkit_name
-    config_dir.mkdir(parents=True, exist_ok=True)
+    path = auth.save_legacy_toolkit_token(toolkit_name, token)
 
-    # Store token
-    token_file = config_dir / 'token'
-    token_file.write_text(token)
+    console.print(f"\n[green]✓ Token stored at: {path}[/green]")
+    console.print(
+        "\n[yellow]Note:[/yellow] per-toolkit tokens are being phased out. "
+        "Run [cyan]scitoolkit login[/cyan] (no toolkit argument) to "
+        "consolidate to a single per-user token."
+    )
 
-    # Set secure permissions (owner read/write only)
-    import os
-    os.chmod(token_file, 0o600)
 
-    console.print(f"\n[green]✓ Token stored at: {token_file}[/green]")
-    console.print(f"\nYou can now run 'scitoolkit publish' from the {toolkit_name} directory.")
+def _login_paste_user_token(token: str, mode: str) -> None:
+    """Non-interactive per-user paste mode."""
+    from . import auth
+
+    token = token.strip()
+    if auth.is_legacy_toolkit_token(token):
+        console.print(
+            "[red]✗ This looks like a legacy per-toolkit token "
+            "(stk_... / toolkit_...).[/red]"
+        )
+        console.print(
+            "Use [cyan]scitoolkit login <toolkit-name> --token <token>[/cyan] "
+            "for the legacy form, or generate a per-user token at "
+            "[link]https://scitoolkit.org/profile/cli-tokens[/link]."
+        )
+        sys.exit(1)
+    if not auth.is_user_token(token):
+        console.print(
+            "[yellow]Warning: per-user tokens normally start with "
+            "[bold]sct_user_[/bold]. The token you provided doesn't match."
+            "[/yellow]"
+        )
+        if not _confirm("Continue anyway?", default=False, mode=mode, consequential=True):
+            sys.exit(1)
+
+    path = auth.save_user_token(token)
+    console.print(f"[green]✓ Token stored at: {path}[/green]")
+
+
+def _login_run_migration_prompt(
+    legacy_files: List[Tuple[str, Path]], mode: str,
+) -> None:
+    """Surface the legacy-tokens migration prompt before the browser-flow.
+
+    The prompt is informational, not blocking — even if the user
+    declines, we still proceed to the browser-flow. The point is to
+    explain why they're about to log in and let them know the legacy
+    files will keep working but become inert (per-user tokens take
+    precedence at publish time).
+    """
+    names = ", ".join(name for name, _ in legacy_files)
+    console.print(
+        f"\n[yellow]Detected legacy per-toolkit tokens for:[/yellow] {names}"
+    )
+    console.print(
+        "Generating a per-user token will consolidate authentication. "
+        "The legacy files will remain on disk but the per-user token "
+        "takes precedence at publish time. To remove the legacy files "
+        "later, run [cyan]scitoolkit logout --clean-legacy[/cyan]."
+    )
+
+    proceed = _confirm(
+        "Generate a per-user token now?",
+        default=True,
+        mode=mode,
+    )
+    if not proceed:
+        console.print(
+            "[dim]Skipped. Re-run [cyan]scitoolkit login[/cyan] anytime to "
+            "do this later.[/dim]"
+        )
+        sys.exit(0)
+
+
+def _login_browser_flow(mode: str) -> None:
+    """Run the browser-flow login dance. Stores the resulting per-user token."""
+    from . import auth
+
+    if mode == "skip":
+        # The browser-flow is interactive by definition; in non-TTY
+        # / no-input mode there's no human to approve. Surface the
+        # workaround flag.
+        raise click.UsageError(
+            "Cannot run the browser-flow login non-interactively. "
+            "Generate a per-user token at "
+            "https://scitoolkit.org/profile/cli-tokens and pass it via "
+            "--token <token>."
+        )
+
+    web_base = os.environ.get("SCITOOLKIT_WEB_URL") or "https://scitoolkit.org"
+    flow = auth.BrowserFlow(web_base=web_base)
+
+    # We don't know the bound port until run() picks one. Print the URL
+    # template now so a headless user knows what's about to happen.
+    console.print(
+        "\n[bold blue]Opening browser for SciToolkit login...[/bold blue]"
+    )
+    console.print(
+        "[dim]If your browser doesn't open automatically, the CLI will "
+        "print the URL below.[/dim]"
+    )
+    console.print(
+        "[dim]Waiting for approval (timeout: "
+        f"{int(auth.BROWSER_FLOW_TIMEOUT_S)}s). Press Ctrl-C to cancel.[/dim]\n"
+    )
+
+    try:
+        result = flow.run()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Login cancelled.[/yellow]")
+        sys.exit(130)
+
+    if result.timed_out:
+        console.print(
+            "[red]✗ Login timed out. No token was saved.[/red]"
+        )
+        console.print(
+            "Try again, or generate a token manually at "
+            "[link]https://scitoolkit.org/profile/cli-tokens[/link] and pass "
+            "it via [cyan]--token <token>[/cyan]."
+        )
+        sys.exit(1)
+
+    if result.denied:
+        console.print(
+            "[yellow]Login denied. No token was saved.[/yellow]"
+        )
+        sys.exit(1)
+
+    if result.error:
+        console.print(f"[red]✗ Login failed: {result.error}[/red]")
+        sys.exit(1)
+
+    if not result.token:
+        console.print(
+            "[red]✗ Login completed but no token was returned. "
+            "Please try again.[/red]"
+        )
+        sys.exit(1)
+
+    if not auth.is_user_token(result.token):
+        # Defense in depth — the website should never send anything else,
+        # but if it does we want a clear error rather than silently
+        # storing a malformed token.
+        console.print(
+            "[red]✗ The website returned an unexpected token format.[/red]"
+        )
+        console.print("[dim]Expected sct_user_... prefix.[/dim]")
+        sys.exit(1)
+
+    path = auth.save_user_token(result.token)
+    console.print(f"\n[green]✓ Logged in. Token stored at: {path}[/green]")
+    console.print(
+        "Run [cyan]stk whoami[/cyan] to verify, or [cyan]stk publish[/cyan] "
+        "from any toolkit you own or collaborate on."
+    )
+
+
+@main.command()
+@click.option(
+    '--clean-legacy', is_flag=True, default=False,
+    help='Also remove ~/.scitoolkit/<toolkit>/token files (legacy per-toolkit tokens).',
+)
+@_interactive_options
+def logout(clean_legacy, yes, no_, no_input):
+    """
+    Sign out and remove the local CLI token.
+
+    Deletes ~/.scitoolkit/token (per-user). Best-effort revokes the
+    token on the backend (the local file is removed regardless of
+    network success). Pass --clean-legacy to also remove any leftover
+    ~/.scitoolkit/<toolkit>/token files from the pre-per-user-token era.
+    """
+    from . import auth
+
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+    user_token = auth.load_user_token()
+
+    if user_token is None and not clean_legacy:
+        legacy = auth.find_legacy_token_files()
+        if legacy:
+            console.print(
+                "[yellow]No per-user token found, but legacy per-toolkit "
+                "tokens exist:[/yellow] " + ", ".join(n for n, _ in legacy)
+            )
+            console.print(
+                "Run [cyan]scitoolkit logout --clean-legacy[/cyan] to remove them."
+            )
+        else:
+            console.print("[dim]Already logged out.[/dim]")
+        return
+
+    if user_token is not None:
+        # Best-effort backend revocation. If the user has many tokens and
+        # we don't know which one this is, we can't supply a token_id —
+        # the backend resolves the bearer token to its own row. Some
+        # backend designs accept "DELETE /cli-tokens/me" or similar; the
+        # current shipped contract is "DELETE /cli-tokens/<id>" only,
+        # so without a stored id we skip the API call. The local file
+        # delete still happens and the user can revoke from the website.
+        # If telemetry shows people want better revocation here, we can
+        # add a "DELETE /cli-tokens/current" or store the id on save.
+        if auth.delete_user_token():
+            console.print(
+                f"[green]✓ Removed per-user token: {auth.USER_TOKEN_PATH}[/green]"
+            )
+            console.print(
+                "[dim]To revoke this token on the server side too, visit "
+                "[link]https://scitoolkit.org/profile/cli-tokens[/link].[/dim]"
+            )
+
+    if clean_legacy:
+        legacy = auth.find_legacy_token_files()
+        if not legacy:
+            console.print("[dim]No legacy per-toolkit tokens to remove.[/dim]")
+        else:
+            names = ", ".join(n for n, _ in legacy)
+            if not _confirm(
+                f"Remove legacy tokens for: {names}?",
+                default=True,
+                mode=mode,
+                consequential=True,
+            ):
+                console.print("[dim]Skipped legacy cleanup.[/dim]")
+                return
+            removed = auth.delete_legacy_token_files()
+            console.print(
+                f"[green]✓ Removed {len(removed)} legacy token "
+                f"file{'s' if len(removed) != 1 else ''}: "
+                f"{', '.join(removed)}[/green]"
+            )
+
+
+@main.command()
+def whoami():
+    """
+    Show which account the current CLI token belongs to.
+
+    Hits the registry's whoami endpoint with whatever token is stored
+    locally. Useful sanity check ("am I about to publish as the right
+    account?").
+    """
+    from . import auth
+
+    token = auth.load_user_token()
+    if token is None:
+        # Fall back to looking at legacy per-toolkit tokens — at least
+        # tell the user something useful about what's authenticated.
+        legacy = auth.find_legacy_token_files()
+        if legacy:
+            names = ", ".join(n for n, _ in legacy)
+            console.print(
+                "[yellow]Not logged in with a per-user token.[/yellow]"
+            )
+            console.print(
+                f"You have legacy per-toolkit tokens for: {names}."
+            )
+            console.print(
+                "Run [cyan]scitoolkit login[/cyan] to consolidate to a "
+                "per-user token."
+            )
+        else:
+            console.print("[yellow]Not logged in.[/yellow]")
+            console.print(
+                "Run [cyan]scitoolkit login[/cyan] to authenticate."
+            )
+        sys.exit(1)
+
+    info = auth.whoami(token)
+    if info is None:
+        console.print(
+            "[red]✗ Could not reach the registry, or the stored token "
+            "is invalid.[/red]"
+        )
+        console.print(
+            "Run [cyan]scitoolkit login[/cyan] to refresh your token, "
+            "or check your network connection."
+        )
+        sys.exit(1)
+
+    email = info.get("email") or "(unknown)"
+    name = info.get("name") or info.get("display_name") or ""
+    auth_method = info.get("auth_method") or "(unknown)"
+    uid = info.get("uid") or info.get("user_id") or ""
+
+    console.print(f"\n[bold]Logged in as:[/bold] {email}")
+    if name:
+        console.print(f"  Display name: {name}")
+    if uid:
+        console.print(f"  User ID:      [dim]{uid}[/dim]")
+    console.print(f"  Auth method:  {auth_method}")
+    console.print(
+        f"  Token file:   [dim]{auth.USER_TOKEN_PATH}[/dim]\n"
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────
+# `scitoolkit config` group — Phase 3C-1 file-canonical config management
+# ────────────────────────────────────────────────────────────────────────
+
+@main.group()
+def config():
+    """Manage per-toolkit configuration files.
+
+    Configuration for each installed toolkit lives at
+    ~/.scitoolkit/config/<toolkit>.yaml. These commands view and
+    mutate that file. Hand-editing the file directly is also fully
+    supported — the file is canonical.
+    """
+    pass
+
+
+def _resolve_toolkit_for_config(toolkit_name: str):
+    """Common helper: load toolkit.yaml + parsed schema (or None).
+
+    Returns ``(toolkit_yaml_path, schema_or_None)`` for a given
+    installed toolkit. ``schema`` is None if the toolkit has no
+    ``config:`` block. Errors out (sys.exit 1) if the toolkit isn't
+    installed.
+    """
+    from .config import TOOLKITS_DIR
+    from .setup import parse_config_block
+
+    toolkit_dir = TOOLKITS_DIR / toolkit_name
+    if not toolkit_dir.exists():
+        console.print(
+            f"[red]✗ Toolkit '{toolkit_name}' is not installed.[/red]"
+        )
+        console.print(
+            f"Run [cyan]scitoolkit install {toolkit_name}[/cyan] first."
+        )
+        sys.exit(1)
+
+    yaml_path = toolkit_dir / "toolkit.yaml"
+    if not yaml_path.exists():
+        console.print(
+            f"[red]✗ {yaml_path} is missing — broken install.[/red]"
+        )
+        sys.exit(1)
+
+    try:
+        with open(yaml_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        console.print(f"[red]✗ Could not read {yaml_path}: {e}[/red]")
+        sys.exit(1)
+
+    raw_block = data.get("config")
+    if not raw_block:
+        return yaml_path, None
+
+    try:
+        schema = parse_config_block(raw_block)
+    except Exception as e:
+        console.print(
+            f"[yellow]Warning: {toolkit_name}'s config: block is "
+            f"malformed: {e}[/yellow]"
+        )
+        return yaml_path, None
+    return yaml_path, schema
+
+
+@config.command(name="path")
+@click.argument("toolkit_name")
+def config_path_cmd(toolkit_name):
+    """Print the absolute path to a toolkit's config file."""
+    from .setup import config_path as _cfg_path
+    _resolve_toolkit_for_config(toolkit_name)  # exits if not installed
+    print(_cfg_path(toolkit_name))
+
+
+@config.command(name="show")
+@click.argument("toolkit_name")
+def config_show(toolkit_name):
+    """Show a toolkit's stored config (secrets masked)."""
+    from .setup import (
+        config_path as _cfg_path,
+        load_config,
+        NEEDS_VALUE_SENTINEL,
+    )
+
+    _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
+    cfg_file = _cfg_path(toolkit_name)
+
+    if not cfg_file.exists():
+        console.print(
+            f"[yellow]No config file yet for {toolkit_name}.[/yellow] "
+            f"({cfg_file})"
+        )
+        if schema and schema.fields:
+            console.print(
+                "Run [cyan]scitoolkit config edit "
+                f"{toolkit_name}[/cyan] to create one, or set fields "
+                "individually with [cyan]config set[/cyan]."
+            )
+        return
+
+    data = load_config(toolkit_name)
+    secret_fields = set()
+    if schema:
+        secret_fields = {
+            f.name for f in schema.fields if f.type == "secret"
+        }
+
+    console.print(
+        f"\n[bold]{toolkit_name}[/bold] [dim]({cfg_file})[/dim]\n"
+    )
+    if not data:
+        console.print("  [dim](empty)[/dim]")
+        return
+
+    for key, value in data.items():
+        if key in secret_fields and value and value != NEEDS_VALUE_SENTINEL:
+            display = "[dim]<set>[/dim]"
+        elif value == NEEDS_VALUE_SENTINEL:
+            display = f"[yellow]{value}[/yellow]"
+        else:
+            display = repr(value) if not isinstance(value, str) else value
+        console.print(f"  [cyan]{key}[/cyan]: {display}")
+
+
+@config.command(name="edit")
+@click.argument("toolkit_name")
+def config_edit(toolkit_name):
+    """Open the toolkit's config file in $EDITOR.
+
+    If the file doesn't exist yet, a template is dropped first so the
+    user lands in a populated buffer. Falls back to nano then vi if
+    $EDITOR isn't set.
+    """
+    from .setup import (
+        config_path as _cfg_path,
+        load_config,
+        save_config,
+        parse_config_block,
+        NEEDS_VALUE_SENTINEL,
+    )
+
+    _resolve_toolkit_for_config(toolkit_name)  # validates install
+    cfg_file = _cfg_path(toolkit_name)
+
+    # Drop a template if the file doesn't exist yet.
+    if not cfg_file.exists():
+        _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
+        if schema:
+            existing = load_config(toolkit_name)
+            for f in schema.fields:
+                if f.name in existing:
+                    continue
+                if f.default is not None:
+                    existing[f.name] = f.default
+                elif f.required:
+                    existing[f.name] = NEEDS_VALUE_SENTINEL
+            save_config(toolkit_name, existing)
+        else:
+            # No schema — just create an empty file so $EDITOR has
+            # something to open.
+            cfg_file.parent.mkdir(parents=True, exist_ok=True)
+            cfg_file.touch()
+            try:
+                os.chmod(cfg_file, 0o600)
+            except (OSError, NotImplementedError):
+                pass
+
+    editor = os.environ.get("EDITOR") or shutil.which("nano") or shutil.which("vi")
+    if not editor:
+        console.print(
+            "[red]✗ No editor available.[/red] Set [cyan]$EDITOR[/cyan] "
+            "or install nano/vi."
+        )
+        console.print(f"You can edit the file directly at: {cfg_file}")
+        sys.exit(1)
+
+    try:
+        subprocess.call([editor, str(cfg_file)])
+    except Exception as e:
+        console.print(f"[red]✗ Editor failed: {e}[/red]")
+        sys.exit(1)
+
+
+@config.command(name="set")
+@click.argument("toolkit_name")
+@click.argument("key")
+@click.argument("value")
+def config_set(toolkit_name, key, value):
+    """Set one config field on a toolkit (preserves other fields/comments)."""
+    from .setup import (
+        config_path as _cfg_path,
+        coerce_value,
+        set_config_value,
+        ConfigError,
+    )
+
+    _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
+
+    parsed: object = value
+    if schema is not None:
+        field = schema.field_by_name(key)
+        if field is None:
+            console.print(
+                f"[yellow]Warning: {key!r} is not declared in "
+                f"{toolkit_name}'s config: schema. Storing as a raw "
+                "string anyway.[/yellow]"
+            )
+        else:
+            try:
+                parsed = coerce_value(field, value)
+            except ConfigError as e:
+                console.print(f"[red]✗ {e}[/red]")
+                sys.exit(1)
+
+    set_config_value(toolkit_name, key, parsed)
+    console.print(
+        f"[green]✓[/green] {toolkit_name}.{key} set "
+        f"[dim]({_cfg_path(toolkit_name)})[/dim]"
+    )
+
+
+@config.command(name="unset")
+@click.argument("toolkit_name")
+@click.argument("key")
+def config_unset(toolkit_name, key):
+    """Remove one config field from a toolkit's config file."""
+    from .setup import unset_config_value
+
+    _resolve_toolkit_for_config(toolkit_name)
+    removed = unset_config_value(toolkit_name, key)
+    if removed:
+        console.print(f"[green]✓[/green] removed {toolkit_name}.{key}")
+    else:
+        console.print(
+            f"[yellow]No such field {key!r} in {toolkit_name}'s "
+            "config.[/yellow]"
+        )
+
+
+@config.command(name="validate")
+@click.argument("toolkit_name")
+def config_validate(toolkit_name):
+    """Check that all required fields are filled in and types are correct."""
+    from .setup import load_state_config
+
+    _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
+    if schema is None or not schema.fields:
+        console.print(
+            f"[dim]{toolkit_name} has no config: schema. Nothing to "
+            "validate.[/dim]"
+        )
+        return
+
+    resolution = load_state_config(toolkit_name, schema)
+    if resolution.ok:
+        n = len(resolution.state_config)
+        console.print(
+            f"[green]✓[/green] {toolkit_name} config is valid "
+            f"({n} field{'s' if n != 1 else ''})"
+        )
+        return
+
+    console.print(f"[red]✗ {toolkit_name} config is incomplete:[/red]")
+    if resolution.missing_required:
+        console.print(
+            "  Missing required: "
+            + ", ".join(resolution.missing_required)
+        )
+    for name, err in resolution.invalid:
+        console.print(f"  Invalid {name}: {err}")
+    sys.exit(1)
+
+
+@main.command()
+@click.argument("toolkit_name")
+@click.option(
+    "--reset", is_flag=True, default=False,
+    help=(
+        "Delete the toolkit's config file before re-running setup. "
+        "Useful when credentials change or you want a fresh start."
+    ),
+)
+@click.option(
+    "--check", is_flag=True, default=False,
+    help=(
+        "Run validate(ctx) only; don't run setup(ctx). Useful to "
+        "diagnose why a toolkit refuses to serve."
+    ),
+)
+@_interactive_options
+def setup(toolkit_name, reset, check, yes, no_, no_input):
+    """
+    Run a toolkit's setup.py script.
+
+    Tier-2 toolkits (those with a setup.py at root) use this command to
+    run their interactive setup flow. Use it to:
+
+    \b
+    - Re-run setup after install (e.g., new credentials needed)
+    - Run setup that was skipped during install (--no-prompt mode)
+    - Trigger setup-script logic like data downloads
+
+    \b
+    Examples:
+        scitoolkit setup aster              # run setup.py::setup(ctx)
+        scitoolkit setup aster --reset      # clear config, re-run setup
+        scitoolkit setup aster --check      # run validate(ctx) only
+    """
+    from .config import TOOLKITS_DIR
+    from .setup import (
+        run_setup_script, validate_setup_script,
+        run_install_setup, parse_config_block,
+        delete_config, config_path,
+    )
+    from .setup.runner import SetupResult
+
+    if reset and check:
+        raise click.UsageError("--reset and --check are mutually exclusive.")
+
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    toolkit_dir = TOOLKITS_DIR / toolkit_name
+    if not toolkit_dir.exists():
+        console.print(
+            f"[red]✗ Toolkit '{toolkit_name}' is not installed.[/red]"
+        )
+        console.print(
+            f"Run [cyan]scitoolkit install {toolkit_name}[/cyan] first."
+        )
+        sys.exit(1)
+
+    setup_py_file = toolkit_dir / "setup.py"
+
+    # ── --check mode ──────────────────────────────────────────────
+    if check:
+        if not setup_py_file.exists():
+            console.print(
+                f"[dim]{toolkit_name} has no setup.py; nothing to "
+                "validate (Tier-1 toolkit).[/dim]"
+            )
+            return
+        result = validate_setup_script(toolkit_name)
+        if result.ok:
+            console.print(
+                f"[green]✓[/green] {toolkit_name}: validate(ctx) passed"
+            )
+            return
+        console.print(
+            f"[red]✗[/red] {toolkit_name}: validate(ctx) failed"
+        )
+        if result.message:
+            console.print(f"  {result.message}")
+        if result.log_path:
+            console.print(f"  Full log: [cyan]{result.log_path}[/cyan]")
+        sys.exit(1)
+
+    # ── --reset mode ──────────────────────────────────────────────
+    if reset:
+        cfg = config_path(toolkit_name)
+        if cfg.exists():
+            confirm_msg = (
+                f"Reset will delete {cfg} and re-run setup. Continue?"
+            )
+            if not _confirm(
+                confirm_msg, default=False, mode=mode, consequential=True,
+            ):
+                console.print("[dim]Aborted.[/dim]")
+                return
+            delete_config(toolkit_name)
+            console.print(f"[dim]Deleted {cfg}[/dim]")
+
+    # ── run Tier 1 first if a config: block is declared ────────────
+    yaml_path = toolkit_dir / "toolkit.yaml"
+    if yaml_path.exists():
+        try:
+            with open(yaml_path) as f:
+                toolkit_meta = yaml.safe_load(f) or {}
+        except Exception:
+            toolkit_meta = {}
+        config_block = toolkit_meta.get("config")
+        if config_block:
+            try:
+                schema = parse_config_block(config_block)
+                run_install_setup(toolkit_name, schema, mode=mode)
+            except Exception as e:
+                console.print(
+                    f"[yellow]Tier-1 declarative setup raised: {e}. "
+                    "Continuing to setup.py.[/yellow]"
+                )
+
+    # ── run Tier 2 (setup.py) if present ───────────────────────────
+    if not setup_py_file.exists():
+        console.print(
+            f"[dim]{toolkit_name} has no setup.py; Tier-1 setup "
+            "complete (or no-op if no config: block).[/dim]"
+        )
+        return
+
+    console.print(f"Running [cyan]{toolkit_name}[/cyan] setup script...")
+    result = run_setup_script(toolkit_name, prompt_mode=mode)
+
+    if result.ok:
+        console.print(
+            f"[green]✓[/green] {toolkit_name} setup complete."
+        )
+        return
+
+    # Failure
+    console.print(f"[red]✗[/red] {toolkit_name} setup failed.")
+    if result.message:
+        console.print(f"  {result.message}")
+    if result.traceback:
+        # Show a short summary; full traceback goes to log file.
+        first_lines = result.traceback.strip().splitlines()
+        if first_lines:
+            console.print(f"  {first_lines[-1]}")
+    if result.log_path:
+        console.print(f"  Full log: [cyan]{result.log_path}[/cyan]")
+    sys.exit(1)
 
 
 @main.command()
@@ -617,21 +1398,42 @@ def publish(dry_run, allow_decrease):
         return
 
     # Step 4: Read authentication token (real publishes only).
-    from .config import CONFIG_DIR
-    token_path = CONFIG_DIR / toolkit_name / 'token'
-
-    if not token_path.exists():
-        console.print(f"[red]✗ Error: No authentication token found for '{toolkit_name}'[/red]")
-        console.print(f"\nRun 'scitoolkit login {toolkit_name}' to authenticate.")
+    #
+    # Resolution order (per docs/PER_USER_TOKEN_DESIGN.md):
+    #   1. ~/.scitoolkit/token              — per-user CLI token (preferred)
+    #   2. ~/.scitoolkit/<toolkit>/token    — legacy per-toolkit fallback
+    #
+    # The backend accepts both during the migration window; the CLI just
+    # picks the per-user one when available.
+    from . import auth as _auth
+    token, source = _auth.load_token_for_publish(toolkit_name)
+    if token is None:
+        console.print(
+            f"[red]✗ Error: No authentication token found for '{toolkit_name}'[/red]"
+        )
+        console.print(
+            "\nRun [cyan]scitoolkit login[/cyan] to authenticate "
+            "(per-user, recommended)."
+        )
+        console.print(
+            f"Or [cyan]scitoolkit login {toolkit_name} --token <stk_...>[/cyan] "
+            "for a legacy per-toolkit token."
+        )
         sys.exit(1)
 
-    try:
-        token = token_path.read_text().strip()
-    except Exception as e:
-        console.print(f"[red]✗ Error reading token: {e}[/red]")
-        sys.exit(1)
-
-    console.print(f"Using token from: [dim]{token_path}[/dim]\n")
+    if source == "user":
+        console.print(
+            f"Using per-user token from: [dim]{_auth.USER_TOKEN_PATH}[/dim]\n"
+        )
+    else:
+        console.print(
+            "Using legacy per-toolkit token from: "
+            f"[dim]{_auth.legacy_token_path(toolkit_name)}[/dim]"
+        )
+        console.print(
+            "[dim]Per-toolkit tokens are being phased out. Run "
+            "[cyan]scitoolkit login[/cyan] to consolidate.[/dim]\n"
+        )
 
     # Step 5: Upload to backend
     console.print("Uploading to registry...")
@@ -696,7 +1498,30 @@ def publish(dry_run, allow_decrease):
 
         elif response.status_code == 401:
             console.print("\n[red]✗ Authentication failed. Invalid token.[/red]")
-            console.print(f"Run 'scitoolkit login {toolkit_name}' to re-authenticate.")
+            if source == "user":
+                console.print(
+                    "Run [cyan]scitoolkit login[/cyan] to re-authenticate. "
+                    "Use [cyan]scitoolkit whoami[/cyan] to check who the "
+                    "current token belongs to."
+                )
+            else:
+                console.print(
+                    f"Run [cyan]scitoolkit login[/cyan] to switch to a "
+                    f"per-user token, or [cyan]scitoolkit login "
+                    f"{toolkit_name} --token <new>[/cyan] to update the "
+                    "legacy per-toolkit token."
+                )
+            sys.exit(1)
+        elif response.status_code == 403:
+            console.print(
+                "\n[red]✗ You don't have permission to publish "
+                f"{toolkit_name}.[/red]"
+            )
+            console.print(
+                "Ask the toolkit's owner to add you as a collaborator, "
+                "or check [cyan]scitoolkit whoami[/cyan] to confirm which "
+                "account this token authenticates as."
+            )
             sys.exit(1)
 
         else:
@@ -1314,14 +2139,11 @@ def install(name, version, no_skills, yes, no_, no_input):
         shutil.rmtree(toolkit_dir, ignore_errors=True)
         sys.exit(1)
 
-    # Setup_script warning (Phase 3C - not yet implemented)
+    # Tier-2 toolkit detection. setup.py at root + setup_script: true
+    # in toolkit.yaml means the Tier-2 setup runner will be invoked
+    # after env setup. Toolkits with only one of the two are surfaced
+    # at ``scitoolkit validate`` time but installed cleanly.
     has_setup_script = (toolkit_dir / 'setup.py').exists()
-    if has_setup_script:
-        console.print(
-            "[yellow]This toolkit declares a custom setup script (setup.py).[/yellow]\n"
-            "[yellow]  The setup system is planned for Phase 3C.[/yellow]\n"
-            "[yellow]  Install will continue, but some functionality may not work until setup runs.[/yellow]\n"
-        )
 
     # Step 7: Setup environment
     console.print()
@@ -1374,7 +2196,12 @@ def install(name, version, no_skills, yes, no_, no_input):
         'has_skills': len(skill_files) > 0,
         'skills_count': len(skill_files),
         'has_setup_script': has_setup_script,
-        'needs_setup': has_setup_script,  # Setup-script toolkits need 3C to run
+        # ``needs_setup`` was the 3C-1 placeholder used to skip Tier-2
+        # toolkits at serve startup; 3C-2 lifts that gate by running
+        # ``validate(ctx)`` instead. Keep the field on disk for backward
+        # compat with anything that might inspect old metadata, but
+        # serve no longer consults it.
+        'needs_setup': has_setup_script,
         'installed_at': datetime.now().isoformat(),
     }
 
@@ -1419,6 +2246,83 @@ def install(name, version, no_skills, yes, no_, no_input):
                 console.print(
                     f"[yellow]Could not surface skills to ~/.claude/skills: {e}[/yellow]"
                 )
+
+    # Phase 3C-1: Tier-1 declarative setup. If toolkit.yaml has a
+    # ``config:`` block, walk it and prompt the user (TTY) or fill
+    # defaults (--no-input). Always succeeds: required fields the user
+    # can't supply land as ``<NEEDS VALUE>`` and ``serve`` will refuse
+    # the toolkit until they're filled.
+    config_block = toolkit_config.get('config') or []
+    if config_block:
+        try:
+            from .setup import parse_config_block, run_install_setup
+            config_schema = parse_config_block(config_block)
+            run_install_setup(name, config_schema, mode=mode)
+        except Exception as e:
+            # The block was already validated by `validate_toolkit`
+            # before download (we wouldn't have reached this point if
+            # it were malformed), so a failure here is unusual. Don't
+            # fail the install — config can be filled in later.
+            console.print(
+                f"[yellow]Warning: configuration setup hit an error: {e}[/yellow]"
+            )
+            console.print(
+                "[yellow]The toolkit is installed, but you'll need to "
+                "fill in its configuration manually before running "
+                "`scitoolkit serve`.[/yellow]"
+            )
+
+    # Phase 3C-2: Tier-2 setup.py. If the toolkit ships a setup.py at
+    # root AND declares setup_script: true, invoke its setup(ctx) now.
+    # The runner spawns the toolkit's venv-Python and routes ctx.* RPCs
+    # back to this process. Like Tier-1, install never fails because of
+    # a setup.py error — the user can re-run via ``scitoolkit setup``.
+    declares_setup_script = bool(toolkit_config.get('setup_script'))
+    if has_setup_script and declares_setup_script:
+        try:
+            from .setup import run_setup_script as _run_setup
+            console.print(
+                f"\n[bold blue]Running {name} setup script...[/bold blue]"
+            )
+            sresult = _run_setup(name, prompt_mode=mode)
+            if sresult.ok:
+                console.print(
+                    f"[green]✓[/green] {name} setup script complete."
+                )
+            else:
+                # Render a one-line summary; full traceback in log file.
+                console.print(
+                    f"[yellow]Setup script reported failure.[/yellow]"
+                )
+                if sresult.message:
+                    console.print(f"[yellow]  {sresult.message}[/yellow]")
+                if sresult.log_path:
+                    console.print(
+                        f"[yellow]  Full log: {sresult.log_path}[/yellow]"
+                    )
+                console.print(
+                    "[yellow]The toolkit is installed but `serve` will "
+                    "skip it until validate(ctx) passes. Fix the issue "
+                    f"and run [cyan]scitoolkit setup {name}[/cyan].[/yellow]"
+                )
+        except Exception as e:
+            console.print(
+                f"[yellow]Warning: setup script invocation failed: "
+                f"{e}[/yellow]"
+            )
+            console.print(
+                f"[yellow]Run [cyan]scitoolkit setup {name}[/cyan] to "
+                "retry.[/yellow]"
+            )
+    elif has_setup_script and not declares_setup_script:
+        # The toolkit ships setup.py but didn't opt in via setup_script:
+        # true. Could be intentional (author hasn't migrated) or an
+        # oversight. Surface as a hint, don't run.
+        console.print(
+            f"[dim]Note: {name} ships a setup.py but doesn't declare "
+            "setup_script: true in toolkit.yaml. Skipping setup. If you "
+            "want to run it, ask the author to enable setup_script.[/dim]"
+        )
 
     # Expected toolkits — companion installs the author flagged. No runtime
     # coupling; we just prompt (TTY) or message (skip mode) and install

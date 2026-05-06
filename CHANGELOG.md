@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.3.0] — 2026-05-06
+
+The configuration system. Toolkits with API keys, downloadable data, and derived state now work end-to-end. The full create → publish → install → setup → serve loop is live for the broadest class of toolkits we've supported. ASTER-class workflows — multi-GB downloads, hardware detection, custom setup logic — are now wireable.
+
+### Added
+
+- **File-canonical YAML configuration** at `~/.scitoolkit/config/<toolkit>.yaml`. Mode 0600, hand-editable, comment-preserving (via `ruamel.yaml`). One file per toolkit, source-of-truth for all configured values. Users edit anytime; runtime always reads fresh.
+- **Two-tier setup system.** Tier 1 — declarative `config:` block in `toolkit.yaml` for simple cases (the user-supplied values). Tier 2 — optional `setup.py` at the toolkit root for complex flows (downloads, hardware detection, multi-step setup). Both write to the same canonical YAML; both feed the same state-injection pipeline at serve time.
+- **Seven config field types:** `string`, `secret`, `path`, `integer`, `float`, `boolean`, `choice`. Each gets per-type validation at parse time. Defaults validated against the declared type. `secret` fields are masked in `scitoolkit config show` and hidden during install prompts. `path` fields tilde-expand. `integer`/`float` support optional `min`/`max` bounds. `choice` requires an `options:` list (≥2 unique entries).
+- **`scitoolkit setup <toolkit>` command** with `--reset` (delete config + re-run; consequential, default-N) and `--check` (run `validate(ctx)` only; useful to diagnose serve-startup skips). Honors `--yes`/`--no`/`--no-input` like the rest of the CLI.
+- **`scitoolkit config` subcommand group:** `show`, `edit` (drops a populated template if no file yet, opens `$EDITOR`), `path`, `set`, `unset`, `validate`. Coerces values per the declared schema. Secrets masked in `show` output.
+- **`scitoolkit init --with-setup` flag** drops a heavily-commented `setup.py.template` alongside the toolkit scaffold and flips `setup_script: true` in the generated `toolkit.yaml`. Mirrors `--with-docker`. Without the flag, `init` produces a Tier-1-only scaffold (no `setup.py`).
+- **Sample `config:` block in the default `init` template** — commented-out by default, exercises 4 of 7 types (`secret`, `path`, `integer`, `choice`) with worked examples. Author uncomments what they need.
+- **`SetupContext` API** for `setup.py` authors. Methods: `info`/`warn`/`error`/`hint`/`success` (Rich-styled output), `prompt`/`prompt_path`/`prompt_int`/`prompt_float`/`prompt_secret`/`confirm`/`choice` (TTY-aware, honor `--yes`/`--no`/`--no-input`), `get_config`/`set_config`/`config` (read/write canonical YAML), `download` (resumable + SHA256 + auto-extract), and standard paths (`toolkit_path`, `data_dir`, `cache_dir`, `config_path`).
+- **Resumable, SHA256-verified downloads** via `ctx.download(url, destination, sha256=..., extract=True)`. Three retries with exponential backoff. Resume via HTTP `Range` headers across calls. Auto-extract for `.tar.gz`/`.tgz`/`.tar.bz2`/`.tbz2`/`.tar`/`.zip`. **Zip-slip defense** on every archive entry — paths that escape `destination` are rejected before any bytes touch disk.
+- **Auto-cache for downloaded files** at `~/.scitoolkit/cache/<urlhash>-<filename>`. Cache key is URL + SHA256 (or URL + filename if no SHA). Cache hits skip the network entirely; SHA verification still runs on hits to catch cache corruption with the same loud failure as a corrupted download.
+- **Mtime-keyed validate cache** at `~/.scitoolkit/cache/_setup_validate.json`. Both successful and failed validates cache (same key shape: `(toolkit_name, config_mtime, setup_py_mtime)`). Cache hits in <1ms vs ~150-170ms for misses (subprocess spawn). Auto-invalidates when either file changes.
+
+### Changed
+
+- **`config:` block in `toolkit.yaml` is list-of-objects** (not dict-keyed). The aspirational pre-3C docs showed `config: { name: { type: ... } }`; shipped form is `config: [{name: ..., type: ...}]`. Order-preserving, matches install-prompt order.
+- **Orchestral-ai dependency bumped to >=1.4** (introduced the `state=[...]` decorator argument the setup system relies on, plus persistent stdio MCPClient).
+- **Serve refusal messaging for setup-incomplete toolkits.** Skipped toolkits now include a clear pointer to `scitoolkit config edit <toolkit>` (Tier-1 missing config) or `scitoolkit setup <toolkit>` (Tier-2 validate failure). No silent fallbacks; no half-running tools.
+- **`validate_toolkit` warning text** updated to reflect shipped Tier-2 behavior (was "Phase 3C-2 won't have anything to invoke" — now "the install pipeline will skip the Tier-2 setup runner").
+
+### Fixed
+
+- **The setup system supersedes the `needs_setup` skip placeholder.** Toolkits with declared config or `setup.py` now go through real validation at serve startup; the old "Phase 3C not yet runnable" skip is gone.
+- **Init template no longer drifts from shipped CLI semantics.** The sample `config:` block uses the shipped list-of-objects shape; the `setup.py` template uses the parameter-passed `ctx` (no `from scitoolkit.setup import SetupContext` — that import would fail in toolkit envs by design).
+
+### Internal
+
+- **New modules:** `scitoolkit/setup/` (storage, schema, prompts, declarative, runner, context, downloads, validate_cache, _rpc — ~2,300 LOC); `scitoolkit/_setup_host.py` (per-toolkit setup-time subprocess entrypoint, ~200 LOC).
+- **Setup-host JSON-RPC channel.** Line-mode JSON over stdin/stdout between the orchestrator/CLI parent and the toolkit's setup-host subprocess. Six methods: `log`, `prompt` (with seven kinds), `set_config`, `download` (with `progress` notifications during transfer), plus the `hello`/`go`/`done` handshake. Independent of the serve-time MCP channel; survives the future Orchestral 1.4 stdio cleanup unchanged.
+- **Test count: 195 → 549 unit tests (+354), 3 → 6 e2e harnesses.** New harnesses: `run_setup_e2e.py` (Tier-1 declarative loop), `run_setup_script_e2e.py` (Tier-2 setup.py loop), `run_aster_synthetic_e2e.py` (ASTER-shaped install + download flow against a localhost mock).
+- **Live-registry release-ritual checklist** at `tests/e2e/manual_arxiv_postship_check.md`. Manual, ~5 minutes, exercises install/serve/call against the production registry. Catches drift between dev work and live behavior.
+- **HANDOFF gotchas** added: #12 (sentinel-default resolver pattern for test isolation; CONFIG_DIR resolves at call time, not import time), #13 (3C-1-era state-config wire format is flat `{state_field: value}`, not per-tool nested), #14 (RPC framing: `hello` always first; setup.py load errors travel via `hello.params.load_error` rather than a pre-hello `done`).
+
+---
+
 ## [0.2.0] — 2026-05-06
 
 The first release after MVP closure. Substantial polish pass focused on agent-friendliness, selective serve, and configuration ergonomics. Driven by user feedback from Tony Menzo (co-creator) and the first wave of real-world usage of the live `arxiv-search` toolkit.

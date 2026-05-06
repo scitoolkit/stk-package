@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scitoolkit"
-version = "0.2.0"
+version = "0.3.0"
 description = "A community repository for scientific agentic tools - discover, share, and use AI tools for science"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,11 +30,17 @@ dependencies = [
     "click>=8.0",
     "requests>=2.31",
     "pyyaml>=6.0",
+    # Used by scitoolkit/setup/storage.py to read/write
+    # ~/.scitoolkit/config/<toolkit>.yaml while preserving user comments
+    # across edits. pyyaml strips comments on dump; ruamel round-trips them.
+    "ruamel.yaml>=0.18",
     "rich>=13.0",
     "pydantic>=2.0",
     # Required by Pydantic's EmailStr at runtime; not imported directly.
     "email-validator>=2.0",
-    "orchestral-ai>=1.0",
+    # 1.4 introduced the `state=[...]` decorator argument that the
+    # Phase 3C-1 setup system relies on for state-field declaration.
+    "orchestral-ai>=1.4",
     "mcp>=1.0",
 ]
 

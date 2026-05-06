@@ -52,6 +52,7 @@ def create_toolkit_from_template(
     name: str,
     path: Path,
     with_docker: bool = False,
+    with_setup: bool = False,
     author: Optional[str] = None,
     email: Optional[str] = None,
     category: str = "general",
@@ -62,16 +63,22 @@ def create_toolkit_from_template(
     Create a new toolkit from template.
 
     Creates the standard toolkit directory structure:
-    - scitoolkit.yaml
+    - toolkit.yaml
     - tools/ (with __init__.py and example_tool.py)
     - requirements.txt
     - README.md
     - Dockerfile (optional)
+    - setup.py + ``setup_script: true`` flag (when ``with_setup=True``)
 
     Args:
         name: Toolkit name
         path: Path where toolkit should be created
         with_docker: Whether to include Dockerfile
+        with_setup: Whether to drop a Tier-2 ``setup.py`` template and
+            flip ``setup_script: true`` in toolkit.yaml. Both must be
+            present for the install-time runner to invoke setup.py;
+            this flag pairs them so an author who wanted setup.py
+            doesn't end up with a silently-disabled scaffold.
         author: Author name (optional)
         email: Author email (optional)
         category: Toolkit category
@@ -155,6 +162,15 @@ tools:
         yaml_template = get_template_path("toolkit.yaml.template")
         yaml_content = render_template(yaml_template, substitutions)
 
+    # If --with-setup was passed, the toolkit will ship a setup.py at
+    # root. The Tier-2 install-time runner only invokes setup.py when
+    # both the file is present AND ``setup_script: true`` is declared
+    # in toolkit.yaml. Drop the flag in here to keep the two in sync;
+    # an author who wants setup.py without the flag is almost always
+    # making a mistake (the file would silently be ignored at install).
+    if with_setup:
+        yaml_content = _insert_setup_script_flag(yaml_content)
+
     (toolkit_path / "toolkit.yaml").write_text(yaml_content)
 
     # Create tools/__init__.py
@@ -203,6 +219,15 @@ tools:
         dockerfile_template = get_template_path("Dockerfile.template")
         dockerfile_content = render_template(dockerfile_template, substitutions)
         (toolkit_path / "Dockerfile").write_text(dockerfile_content)
+
+    # Create setup.py if requested. Pairs with the ``setup_script: true``
+    # flag we already inserted into toolkit.yaml above. The template is
+    # heavily-commented so authors can copy-paste-modify; the body is a
+    # no-op (`return True`) until they uncomment what they need.
+    if with_setup:
+        setup_template = get_template_path("setup.py.template")
+        setup_content = render_template(setup_template, substitutions)
+        (toolkit_path / "setup.py").write_text(setup_content)
 
     # Create .gitignore
     gitignore_content = """# Python
@@ -318,6 +343,33 @@ def suggest_next_version(current_version: str) -> str:
     except (ValueError, IndexError, AttributeError):
         pass
     return "0.1.0"
+
+
+def _insert_setup_script_flag(yaml_content: str) -> str:
+    """Add ``setup_script: true`` to a rendered toolkit.yaml.
+
+    The flag tells the install-time runner that the toolkit ships a
+    Tier-2 ``setup.py``; without it, the install pipeline skips
+    ``setup.py`` even if the file exists. Insert just before the
+    ``tools:`` block so the line lands near the other toolkit-level
+    metadata (name, version, category, ...) and not buried inside
+    the tools list.
+
+    Idempotent: if the flag is already declared (e.g., the registry-
+    prefilled YAML happens to include it), don't double-insert.
+    """
+    if "setup_script:" in yaml_content:
+        return yaml_content
+    marker = "\ntools:"
+    if marker not in yaml_content:
+        # Defensive: every toolkit.yaml has a tools: block. If we
+        # somehow don't find it, append at end.
+        return yaml_content + "\nsetup_script: true\n"
+    return yaml_content.replace(
+        marker,
+        "\nsetup_script: true\n" + marker,
+        1,
+    )
 
 
 def format_keywords_yaml(keywords: list) -> str:

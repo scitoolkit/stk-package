@@ -15,16 +15,21 @@ Responsibilities:
 
 Out of scope for the MVP (deferred per direction):
 
-- Restart-on-crash with exponential backoff (only basic detection here).
 - Per-call timeout enforcement (relies on MCPClient's default).
 - TUI-facing event subscription API.
 - Hot reload.
+
+Implemented post-MVP:
+
+- Auto-restart of crashed per-toolkit subprocesses with exponential
+  backoff (1s, 4s, 16s; budget 3). See §3.3 of SERVE_ARCHITECTURE.md.
 
 See ``stk-package/docs/SERVE_ARCHITECTURE.md`` for the full design.
 """
 
 from __future__ import annotations
 
+import enum
 import json
 import os
 import signal
@@ -43,6 +48,13 @@ from ..logging.logger import ToolLogger, get_logger
 
 
 HOST_HANDSHAKE_TIMEOUT_S = 15.0  # generous; conda startup can be slow
+# After the host emits its handshake JSON, FastMCP still has to finish
+# binding the port and accepting connections — there's a tiny window
+# where the port is reported but not yet listening. A subsequent
+# ``MCPClient.connect()`` can race that window and fail with
+# ``httpx.ConnectError``. We poll the port for accept-readiness with this
+# total budget before giving up. In practice it resolves in <100 ms.
+HOST_PORT_READY_TIMEOUT_S = 5.0
 # The MCPClient's `timeout` parameter governs *both* the initial HTTP
 # connect and each subsequent call. We default it to 60 s so long-running
 # scientific calls don't fail prematurely.
@@ -54,6 +66,28 @@ HOST_HANDSHAKE_TIMEOUT_S = 15.0  # generous; conda startup can be slow
 # `scitoolkit serve --call-timeout SECONDS`.
 DEFAULT_CALL_TIMEOUT_S = 60.0
 SHUTDOWN_GRACEFUL_S = 5.0
+
+# Restart policy for a per-toolkit subprocess that crashes *after* a
+# successful initial connect (i.e. CRASHED in the lifecycle state machine).
+#
+# Initial-launch failures do NOT consume this budget — if `start()` can't
+# bring a toolkit up (spawn failed, handshake timed out, MCPClient connect
+# failed), the orchestrator skips that toolkit immediately and keeps
+# serving the rest. Restart budget is reserved for *runtime* crashes
+# (subprocess died mid-call, OOM-killed between calls). Configuration
+# bugs don't get fixed by restarting three times in 21 seconds; flakes do.
+RESTART_BUDGET = 3
+RESTART_BACKOFF_S = (1.0, 4.0, 16.0)
+
+
+class ToolkitState(enum.Enum):
+    """Per-toolkit lifecycle state. See SERVE_ARCHITECTURE.md §3.7."""
+    DISCOVERED = "discovered"  # walked, classified, not yet spawned
+    STARTING = "starting"      # spawn → handshake → connect in flight
+    READY = "ready"            # MCPClient connected; calls succeeding
+    CRASHED = "crashed"        # detected dead; restart pending or running
+    FAILED = "failed"          # restart budget exhausted; terminal
+    STOPPED = "stopped"        # user toggled off (TUI hook; unused now)
 
 
 # ── data classes ────────────────────────────────────────────────────────
@@ -78,7 +112,13 @@ class ToolkitDiscovery:
 
 @dataclass
 class ToolkitRuntime:
-    """A successfully spawned toolkit, post-handshake."""
+    """A successfully spawned toolkit, post-handshake.
+
+    Carries the data needed to talk to the subprocess (proc, port, client)
+    plus the lifecycle state used by the restart machinery. ``discovery``
+    is held so a restart can re-build the spawn argv without re-walking
+    TOOLKITS_DIR or re-reading metadata.
+    """
     name: str
     path: Path
     proc: subprocess.Popen
@@ -87,6 +127,17 @@ class ToolkitRuntime:
     mcp_client: Any  # orchestral.mcp.MCPClient
     stderr_thread: Optional[threading.Thread] = None
     stderr_logfile_handle: Optional[Any] = None
+    # Restart machinery. See RESTART_BUDGET / RESTART_BACKOFF_S.
+    state: ToolkitState = ToolkitState.READY
+    restart_attempts: int = 0
+    # Serializes restart kickoff so parallel tool calls on the same
+    # crashed toolkit don't double-spawn the restart thread.
+    restart_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Original discovery record; needed to re-spawn on restart.
+    discovery: Optional[ToolkitDiscovery] = None
+    # Last error seen on a permanently-failed toolkit (for the agent-facing
+    # message and the `toolkit_permanently_failed` telemetry).
+    last_error: str = ""
 
 
 # ── discovery ───────────────────────────────────────────────────────────
@@ -121,10 +172,14 @@ def discover_toolkits(toolkits_dir: Path = TOOLKITS_DIR) -> List[ToolkitDiscover
         env = meta.get("environment")
         if env == "docker":
             skip = "Docker mode (Phase 3B not yet supported)"
-        elif meta.get("needs_setup"):
-            skip = "setup not yet run (Phase 3C)"
         elif env not in ("venv", "conda"):
             skip = f"unknown environment type: {env!r}"
+        # NB: ``meta.get("needs_setup")`` (Tier-2 setup.py present)
+        # used to skip here in 3C-1 with "Phase 3C-2 not yet runnable."
+        # That gate is now lifted; ``_resolve_state_config`` calls
+        # ``validate_setup_script_cached`` for setup_script toolkits
+        # and surfaces the validate result as the skip reason if it
+        # fails.
 
         found.append(ToolkitDiscovery(
             name=entry.name, path=entry, meta=meta, skip_reason=skip,
@@ -132,17 +187,105 @@ def discover_toolkits(toolkits_dir: Path = TOOLKITS_DIR) -> List[ToolkitDiscover
     return found
 
 
+def _resolve_state_config(
+    disc: ToolkitDiscovery,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate the toolkit's stored config against its declared schema.
+
+    Returns ``(state_config_dict, skip_reason)``. Exactly one is non-None:
+
+    - ``({...}, None)`` — config is valid (or the toolkit has no
+      ``config:`` block, in which case ``state_config_dict`` is empty).
+      The orchestrator passes the dict to the host subprocess via
+      ``--state-config <json>``.
+    - ``(None, reason)`` — the toolkit declared required fields the
+      user hasn't filled in, or stored values fail validation. The
+      orchestrator skips this toolkit with ``reason`` in the banner.
+
+    Imports the setup module lazily so a malformed ``config:`` block
+    in some other toolkit can't take down the whole orchestrator
+    startup. Per-toolkit failures stay per-toolkit.
+    """
+    # Read the toolkit's published `config:` block from its toolkit.yaml.
+    # The metadata file (.stk_meta.json) doesn't carry it because the
+    # block is the toolkit author's published schema, not user data.
+    yaml_path = disc.path / "toolkit.yaml"
+    if not yaml_path.exists():
+        # Broken install at this point shouldn't happen — discover
+        # already filtered missing metadata — but be defensive.
+        return None, "toolkit.yaml missing (broken install)"
+
+    try:
+        import yaml as _yaml
+        with open(yaml_path, "r") as f:
+            tk_data = _yaml.safe_load(f) or {}
+    except Exception as e:
+        return None, f"unreadable toolkit.yaml: {e}"
+
+    raw_block = tk_data.get("config") or []
+    has_setup_py = (disc.path / "setup.py").exists()
+    declares_setup = bool(tk_data.get("setup_script"))
+
+    # Tier-1 declarative validation (config: block).
+    state_config: Dict[str, Any] = {}
+    if raw_block:
+        try:
+            from ..setup import parse_config_block, load_state_config
+        except Exception as e:
+            return None, f"setup module unavailable: {e}"
+
+        try:
+            schema = parse_config_block(raw_block)
+        except Exception as e:
+            return None, f"invalid config: schema in toolkit.yaml: {e}"
+
+        resolution = load_state_config(disc.name, schema)
+        if not resolution.ok:
+            return None, "config incomplete — " + (resolution.skip_reason() or "unknown")
+        state_config = dict(resolution.state_config)
+
+    # Tier-2 validate(ctx) — only if the toolkit declares setup_script
+    # AND has a setup.py at root. Both checks are needed because a
+    # toolkit could ship one without the other (broken state we surface
+    # explicitly at validate / publish time, but be defensive here).
+    if declares_setup and has_setup_py:
+        try:
+            from ..setup import validate_setup_script_cached
+        except Exception as e:
+            return None, f"setup module unavailable: {e}"
+        try:
+            v_result = validate_setup_script_cached(disc.name)
+        except Exception as e:
+            return None, f"validate(ctx) failed to run: {e}"
+        if not v_result.ok:
+            msg = v_result.message or "validate(ctx) returned False"
+            return None, f"validate(ctx) failed — {msg}"
+
+    return state_config, None
+
+
 # ── subprocess launch ───────────────────────────────────────────────────
 
 
-def _build_host_command(disc: ToolkitDiscovery) -> List[str]:
-    """Return the argv for spawning the per-toolkit host subprocess."""
+def _build_host_command(
+    disc: ToolkitDiscovery,
+    *,
+    state_config: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return the argv for spawning the per-toolkit host subprocess.
+
+    ``state_config`` is the validated Phase 3C-1 config dict (flat
+    ``{state_field: value}``) for the toolkit. ``None`` or empty dict
+    is serialized to ``""`` for the host's empty-input fast path.
+    """
+    state_arg = ""
+    if state_config:
+        state_arg = json.dumps(state_config, ensure_ascii=False)
     base_args = [
         "-m", "scitoolkit._toolkit_host",
         "--toolkit-dir", str(disc.path),
         "--name", disc.name,
-        # state-config is empty until Phase 3C
-        "--state-config", "",
+        "--state-config", state_arg,
     ]
     if disc.env_type == "venv":
         python_exe = disc.meta.get("python_path")
@@ -186,9 +329,19 @@ def _build_host_env(toolkit_path: Path) -> Dict[str, str]:
     return env
 
 
-def _spawn_host(disc: ToolkitDiscovery, logger: ToolLogger) -> subprocess.Popen:
-    """Launch the host subprocess. Returns the Popen handle."""
-    cmd = _build_host_command(disc)
+def _spawn_host(
+    disc: ToolkitDiscovery,
+    logger: ToolLogger,
+    *,
+    state_config: Optional[Dict[str, Any]] = None,
+) -> subprocess.Popen:
+    """Launch the host subprocess. Returns the Popen handle.
+
+    ``state_config`` is forwarded to the host via ``--state-config``
+    JSON so ``_inject_state_into_tools`` can populate ``@define_tool(
+    state=[...])`` fields before any tool call lands.
+    """
+    cmd = _build_host_command(disc, state_config=state_config)
     env = _build_host_env(disc.path)
     # stdin is a pipe so we can later send a graceful shutdown JSON line
     # and so closing the pipe also terminates the host.
@@ -284,6 +437,36 @@ def _prune_per_toolkit_log_if_oversized(log_path: Path) -> None:
     except Exception:
         # Pruning is best-effort; never block startup over it.
         pass
+
+
+def _wait_for_port_ready(
+    port: int, timeout_s: float = HOST_PORT_READY_TIMEOUT_S,
+) -> bool:
+    """Block until 127.0.0.1:port accepts TCP connections, or timeout.
+
+    The host emits its handshake before ``mcp.run()`` actually binds the
+    listen socket — there's a small window where the port number is known
+    but not yet listening. Without this poll, ``MCPClient.connect()`` can
+    lose the race and fail with ``httpx.ConnectError``. The race is
+    invisible at first launch (the orchestrator does enough other work
+    between handshake and connect to mask it) but reliable on restart
+    when Python is warm and the loop runs faster.
+
+    Returns True if the port came up, False on timeout. Caller decides
+    whether to proceed (we still try to connect either way; the connect
+    error will be more informative than a timeout from here).
+    """
+    import socket
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            try:
+                s.connect(("127.0.0.1", port))
+                return True
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.05)
+    return False
 
 
 def _start_stderr_pump(
@@ -436,43 +619,58 @@ class Orchestrator:
 
     # ── per-toolkit launch ──────────────────────────────────────────────
 
-    def _launch_one(self, disc: ToolkitDiscovery) -> None:
-        """Spawn host, read handshake, connect MCPClient, build proxies.
+    @dataclass
+    class _SpawnResult:
+        """Internal: artifacts of a successful spawn → connect sequence."""
+        proc: subprocess.Popen
+        stderr_thread: threading.Thread
+        stderr_fh: Any
+        port: int
+        upstream_tools: List[str]
+        client: Any  # orchestral.mcp.MCPClient
 
-        On any failure: log clearly, kill the subprocess, skip this toolkit,
-        keep going with the rest.
+    def _spawn_and_connect(
+        self,
+        disc: ToolkitDiscovery,
+        *,
+        state_config: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional["Orchestrator._SpawnResult"], Optional[str]]:
+        """Spawn the host, read handshake, connect MCPClient.
+
+        Returns ``(SpawnResult, None)`` on success or ``(None, error)`` on
+        failure. On failure, any subprocess that did get spawned is killed
+        before returning.
+
+        Used both by initial launch (``_launch_one``) and by restart
+        (``_attempt_restart``). Does not touch ``self._runtimes`` or the
+        proxy-tools list.
+
+        ``state_config`` is forwarded to ``_spawn_host`` so the toolkit
+        host can inject Phase 3C-1 declarative config values onto its
+        tool instances before they're called.
         """
         try:
-            proc = _spawn_host(disc, self.logger)
+            proc = _spawn_host(disc, self.logger, state_config=state_config)
         except Exception as e:
-            self.console.print(
-                f"  [red]✗[/red] [dim]{disc.name:<18}[/dim] "
-                f"[red]could not spawn: {e}[/red]"
-            )
-            self.logger.log_event(
-                "toolkit_skipped", toolkit=disc.name,
-                message=f"spawn failed: {e}", level="error",
-            )
-            return
+            return None, f"spawn failed: {e}"
 
         # Pump stderr to <toolkit>.log immediately (so import failures land there).
         stderr_thread, stderr_fh = _start_stderr_pump(proc, disc.name)
 
-        # Read handshake.
         hs, err = _read_handshake(proc, HOST_HANDSHAKE_TIMEOUT_S)
         if err:
-            self.console.print(
-                f"  [red]✗[/red] [dim]{disc.name:<18}[/dim] [red]{err}[/red]"
-            )
-            self.logger.log_event(
-                "toolkit_skipped", toolkit=disc.name,
-                message=err, level="error",
-            )
             self._kill(proc)
-            return
+            return None, err
 
         port = hs["port"]
         upstream_tools = hs["tools"]
+
+        # Wait for the port to actually accept connections. The host
+        # emits its handshake before mcp.run() binds the socket; without
+        # this poll, MCPClient.connect() can race the bind and fail with
+        # the opaque "TaskGroup (1 sub-exception)" / httpx.ConnectError
+        # combo. See HOST_PORT_READY_TIMEOUT_S.
+        _wait_for_port_ready(port)
 
         # Connect MCPClient (HTTP loopback).
         #
@@ -497,20 +695,67 @@ class Orchestrator:
             )
             client.connect()
         except Exception as e:
+            self._kill(proc)
+            return None, f"mcp connect failed: {e}"
+
+        return Orchestrator._SpawnResult(
+            proc=proc,
+            stderr_thread=stderr_thread,
+            stderr_fh=stderr_fh,
+            port=port,
+            upstream_tools=upstream_tools,
+            client=client,
+        ), None
+
+    def _launch_one(self, disc: ToolkitDiscovery) -> None:
+        """Spawn host, read handshake, connect MCPClient, build proxies.
+
+        On any failure: log clearly, skip this toolkit, keep going with
+        the rest. Initial-launch failures do NOT consume the per-toolkit
+        restart budget — see the comment on ``RESTART_BUDGET``.
+
+        Phase 3C-1: before spawning, resolve the toolkit's stored
+        config against its declared schema. Missing required fields or
+        invalid values short-circuit to a skip with a clear pointer to
+        ``scitoolkit config edit <toolkit>``.
+        """
+        # Resolve declarative state-config first. A missing-required-
+        # field condition means we never spawn.
+        state_config, config_err = _resolve_state_config(disc)
+        if config_err is not None:
             self.console.print(
                 f"  [red]✗[/red] [dim]{disc.name:<18}[/dim] "
-                f"[red]MCP connect failed: {e}[/red]"
+                f"[red]{config_err}[/red]"
+            )
+            self.console.print(
+                f"     [dim]Edit:[/dim] "
+                f"~/.scitoolkit/config/{disc.name}.yaml"
+            )
+            self.console.print(
+                f"     [dim]Or:[/dim] "
+                f"scitoolkit config edit {disc.name}"
             )
             self.logger.log_event(
                 "toolkit_skipped", toolkit=disc.name,
-                message=f"mcp connect failed: {e}", level="error",
+                message=config_err, level="warn",
             )
-            self._kill(proc)
             return
+
+        spawn, err = self._spawn_and_connect(disc, state_config=state_config)
+        if err is not None:
+            self.console.print(
+                f"  [red]✗[/red] [dim]{disc.name:<18}[/dim] [red]{err}[/red]"
+            )
+            self.logger.log_event(
+                "toolkit_skipped", toolkit=disc.name,
+                message=err, level="error",
+            )
+            return
+        assert spawn is not None  # for type checkers
 
         self.logger.log_event(
             "mcp_client_connected", toolkit=disc.name,
-            port=port, tool_count=len(upstream_tools),
+            port=spawn.port, tool_count=len(spawn.upstream_tools),
         )
 
         # Build proxies from the canonical MCP listing (richer schema info
@@ -534,9 +779,12 @@ class Orchestrator:
                 if q.startswith(f"{disc.name}__"):
                     tool_disable_set.add(q.split("__", 1)[1])
 
+        # Forwarder is bound to the toolkit *name*, not the client. The
+        # forwarder looks up the live MCPClient on every call so a restart
+        # that swaps the client is picked up transparently.
         exposed_tools: List[str] = []
-        forward = self._make_forwarder(disc.name, client)
-        for defn in client.get_tool_definitions():
+        forward = self._make_forwarder(disc.name)
+        for defn in spawn.client.get_tool_definitions():
             upstream_name = defn["name"]
             if tool_filter is not None and upstream_name not in tool_filter:
                 continue
@@ -557,31 +805,283 @@ class Orchestrator:
         self._runtimes[disc.name] = ToolkitRuntime(
             name=disc.name,
             path=disc.path,
-            proc=proc,
-            port=port,
+            proc=spawn.proc,
+            port=spawn.port,
             upstream_tool_names=exposed_tools,
-            mcp_client=client,
-            stderr_thread=stderr_thread,
-            stderr_logfile_handle=stderr_fh,
+            mcp_client=spawn.client,
+            stderr_thread=spawn.stderr_thread,
+            stderr_logfile_handle=spawn.stderr_fh,
+            state=ToolkitState.READY,
+            discovery=disc,
         )
         self.logger.log_event(
             "toolkit_loaded", toolkit=disc.name,
             tool_count=len(exposed_tools),
         )
 
-    def _make_forwarder(self, toolkit_name: str, client: Any):
+    # ── restart machinery (subprocess crash recovery) ──────────────────
+
+    # See SERVE_ARCHITECTURE.md §3.3 / §3.7 and RESTART_BUDGET above.
+
+    @staticmethod
+    def _is_crash_exception(exc: BaseException) -> bool:
+        """Decide whether an exception from ``client.call_tool`` indicates
+        the subprocess died (vs. the tool itself raising).
+
+        Crash signals: connection-class errors from httpx or stdlib. Tool
+        exceptions (RuntimeError, ValueError, etc. raised inside the
+        tool body) are *not* crashes — Orchestral catches those upstream
+        and turns them into ``isError=True`` MCP results that come back
+        through the wire normally; we only see them when something more
+        fundamental is wrong.
+
+        ``proc.poll() is not None`` is the load-bearing check (handled
+        by the caller via ``_classify_call_failure``); this function is
+        the exception-shape heuristic that runs first.
+        """
+        # ConnectionError covers most stdlib-level cases (connection
+        # refused, reset, etc.). httpx errors don't subclass it, so we
+        # match by name to avoid a hard import dependency on httpx (it
+        # comes in transitively via the MCP client).
+        if isinstance(exc, ConnectionError):
+            return True
+        cls_name = type(exc).__name__
+        if cls_name in (
+            "ConnectError",         # httpx: TCP connect failed
+            "RemoteProtocolError",  # httpx: server closed connection mid-stream
+            "ReadError",            # httpx: socket read failed
+        ):
+            return True
+        # ExceptionGroup / TaskGroup wrapped errors (anyio): unwrap one level.
+        inner = getattr(exc, "exceptions", None)
+        if inner:
+            return any(Orchestrator._is_crash_exception(e) for e in inner)
+        return False
+
+    def _classify_call_failure(
+        self, rt: ToolkitRuntime, exc: BaseException
+    ) -> bool:
+        """Return True iff the failure represents a subprocess crash.
+
+        Combines the exception shape with a ``proc.poll()`` check — even
+        if the exception type doesn't look connection-y, a dead subprocess
+        is a crash.
+        """
+        if self._is_crash_exception(exc):
+            return True
+        try:
+            return rt.proc.poll() is not None
+        except Exception:
+            return False
+
+    def _schedule_restart(self, rt: ToolkitRuntime) -> None:
+        """If no restart is in flight, start one on a background thread.
+
+        The lock guarantees exactly one restart attempt is queued per
+        crash event, even when parallel tool calls all detect the same
+        crashed subprocess.
+        """
+        with rt.restart_lock:
+            if rt.state == ToolkitState.STARTING:
+                # A restart is already running; nothing to do.
+                return
+            if rt.state == ToolkitState.FAILED:
+                # Permanently failed; no further restart attempts.
+                return
+            if rt.restart_attempts >= RESTART_BUDGET:
+                rt.state = ToolkitState.FAILED
+                self.logger.log_event(
+                    "toolkit_permanently_failed", toolkit=rt.name,
+                    message=rt.last_error or "restart budget exhausted",
+                    level="error",
+                    attempts=rt.restart_attempts,
+                    final_error=rt.last_error or "",
+                )
+                return
+            attempt = rt.restart_attempts + 1
+            backoff = RESTART_BACKOFF_S[
+                min(attempt - 1, len(RESTART_BACKOFF_S) - 1)
+            ]
+            rt.state = ToolkitState.STARTING
+            self.logger.log_event(
+                "restart_scheduled", toolkit=rt.name,
+                attempt=attempt, backoff_s=backoff,
+            )
+            t = threading.Thread(
+                target=self._attempt_restart,
+                args=(rt, attempt, backoff),
+                name=f"restart-{rt.name}-{attempt}",
+                daemon=True,
+            )
+            t.start()
+
+    def _attempt_restart(
+        self, rt: ToolkitRuntime, attempt: int, backoff_s: float
+    ) -> None:
+        """Wait ``backoff_s``, then try to spawn-and-connect again.
+
+        Runs on a daemon thread. On success, swaps in the new subprocess
+        and client and returns to READY. On failure, increments the
+        attempt counter; if budget remains, schedules the next attempt;
+        otherwise marks the toolkit FAILED.
+        """
+        if self._shutdown_initiated:
+            return
+        time.sleep(backoff_s)
+        if self._shutdown_initiated:
+            return
+
+        self.logger.log_event(
+            "restart_attempt", toolkit=rt.name, attempt=attempt,
+        )
+
+        if rt.discovery is None:
+            # Defensive: shouldn't happen for a runtime we built.
+            rt.state = ToolkitState.FAILED
+            rt.last_error = "missing discovery record"
+            self.logger.log_event(
+                "toolkit_permanently_failed", toolkit=rt.name,
+                message="missing discovery record", level="error",
+                attempts=attempt, final_error="missing discovery record",
+            )
+            return
+
+        # Best-effort cleanup of the prior MCPClient. Each MCPClient
+        # owns a daemon thread running its own asyncio loop; abandoning
+        # them across many restarts would leak threads and event-loop
+        # state. Disconnect failures are non-fatal (the client may
+        # already be in a broken state from the connection drop).
+        try:
+            rt.mcp_client.disconnect()
+        except Exception:
+            pass
+
+        # Best-effort cleanup of the prior dead subprocess. The proc may
+        # already be reaped, but if it died by exception (not exit) the
+        # zombie sticks around until we wait on it.
+        try:
+            if rt.proc.poll() is None:
+                self._kill(rt.proc, name=rt.name)
+        except Exception:
+            pass
+
+        # Re-resolve state-config on restart in case the user edited the
+        # config file between sessions (the file is canonical; we always
+        # read fresh). Same shape as initial launch: a config error here
+        # marks the toolkit failed for this restart attempt.
+        state_config, config_err = _resolve_state_config(rt.discovery)
+        if config_err is not None:
+            rt.restart_attempts = attempt
+            rt.last_error = config_err
+            self.logger.log_event(
+                "restart_failed", toolkit=rt.name,
+                attempt=attempt, message=config_err, level="warn",
+            )
+            rt.state = ToolkitState.FAILED
+            self.logger.log_event(
+                "toolkit_permanently_failed", toolkit=rt.name,
+                message=config_err, level="error",
+                attempts=attempt, final_error=config_err,
+            )
+            return
+
+        spawn, err = self._spawn_and_connect(
+            rt.discovery, state_config=state_config,
+        )
+        if err is not None:
+            rt.restart_attempts = attempt
+            rt.last_error = err
+            self.logger.log_event(
+                "restart_failed", toolkit=rt.name,
+                attempt=attempt, message=err, level="warn",
+            )
+            if attempt >= RESTART_BUDGET:
+                rt.state = ToolkitState.FAILED
+                self.logger.log_event(
+                    "toolkit_permanently_failed", toolkit=rt.name,
+                    message=err, level="error",
+                    attempts=attempt, final_error=err,
+                )
+                # Note: we deliberately do NOT send an MCP
+                # `tools/list_changed` notification here. Orchestral's
+                # MCPServer exposes no public surface for arbitrary
+                # notifications; logging is the best we can do today.
+                # See HANDOFF.md "upstream-blocked" entry.
+            else:
+                # State stays STARTING via _schedule_restart's transition;
+                # reset to CRASHED so the next call's _schedule_restart
+                # treats it as a fresh schedule (not a reentry). Then
+                # schedule the next attempt with the longer backoff.
+                rt.state = ToolkitState.CRASHED
+                self._schedule_restart(rt)
+            return
+
+        # Success. Swap in the new subprocess and client; keep the same
+        # ToolkitRuntime object so the proxy's forwarder (which looks up
+        # by name) sees the new client on its next call.
+        assert spawn is not None
+        rt.proc = spawn.proc
+        rt.port = spawn.port
+        rt.mcp_client = spawn.client
+        rt.stderr_thread = spawn.stderr_thread
+        rt.stderr_logfile_handle = spawn.stderr_fh
+        rt.state = ToolkitState.READY
+        rt.restart_attempts = attempt
+        rt.last_error = ""
+        # Per SERVE_ARCHITECTURE.md §3.3: "at most 3 restarts per toolkit
+        # per orchestrator session." We count *attempts* (success or
+        # failure), not failures. A toolkit that crashes 3 separate times
+        # in one session is suspect — silently restarting forever masks
+        # the bug. The 4th crash transitions to FAILED via _schedule_restart.
+        self.logger.log_event(
+            "restart_succeeded", toolkit=rt.name,
+            attempt=attempt, port=spawn.port,
+            tool_count=len(spawn.upstream_tools),
+        )
+
+    def _make_forwarder(self, toolkit_name: str):
         """Return a closure that the proxy uses to invoke an upstream tool.
 
-        We log start/complete here rather than from ProxyTool so the proxy
-        stays a dumb forwarder.
+        Bound to the toolkit *name*, not its MCPClient. The forwarder
+        resolves the live runtime on each call so a restart that swaps
+        in a fresh client is picked up transparently. Crash detection
+        and restart scheduling happen here.
         """
         logger = self.logger
 
         def forward(upstream_name: str, kwargs: Dict[str, Any]) -> str:
+            rt = self._runtimes.get(toolkit_name)
+            if rt is None:
+                # Should not happen — runtime is created before any proxy
+                # tool that references it. Defensive.
+                return (
+                    f"Tool unavailable: {toolkit_name} runtime not registered."
+                )
+
+            # If the toolkit is in a non-ready state, return guidance
+            # without attempting the call. This covers two cases:
+            #   - CRASHED: a prior call detected a dead subprocess; a
+            #     restart is in flight or will be scheduled by this call.
+            #   - FAILED: budget exhausted; no point trying.
+            if rt.state == ToolkitState.FAILED:
+                return (
+                    f"Tool unavailable: subprocess crashed "
+                    f"{rt.restart_attempts} times. Marked failed for this "
+                    f"serve session. Run scitoolkit logs for details."
+                )
+            if rt.state in (ToolkitState.CRASHED, ToolkitState.STARTING):
+                # Make sure a restart is queued (idempotent thanks to lock).
+                self._schedule_restart(rt)
+                return (
+                    f"Tool unavailable: restart in progress "
+                    f"(attempt {rt.restart_attempts + 1} of {RESTART_BUDGET}). "
+                    f"Retry shortly."
+                )
+
             tid = logger.log_tool_start(toolkit_name, upstream_name, kwargs)
             t0 = time.monotonic()
             try:
-                result = client.call_tool(upstream_name, kwargs)
+                result = rt.mcp_client.call_tool(upstream_name, kwargs)
                 duration = time.monotonic() - t0
                 logger.log_tool_complete(tid, duration=duration, success=True)
                 return result
@@ -594,11 +1094,32 @@ class Orchestrator:
                 logger.log_tool_complete(
                     tid, duration=duration, success=False, error=detail,
                 )
-                # Surface the failure to the upstream MCP client (Claude
-                # Code) as an error string. MCPServer's handler turns
-                # exceptions into MCP error replies, so re-raising would
-                # also work — but returning the string is more legible.
-                return f"[scitoolkit] {upstream_name} failed after {duration:.1f}s: {detail}"
+
+                if self._classify_call_failure(rt, e):
+                    # Subprocess died. Transition to CRASHED, schedule
+                    # restart, return guidance.
+                    pid = rt.proc.pid
+                    rt.state = ToolkitState.CRASHED
+                    rt.last_error = detail
+                    self.logger.log_event(
+                        "subprocess_crashed", toolkit=toolkit_name,
+                        message=detail, level="warn",
+                        pid=pid, state_before="ready",
+                    )
+                    self._schedule_restart(rt)
+                    next_attempt = min(
+                        rt.restart_attempts + 1, RESTART_BUDGET
+                    )
+                    return (
+                        f"Tool unavailable: subprocess crashed. Automatic "
+                        f"restart scheduled (attempt {next_attempt} of "
+                        f"{RESTART_BUDGET}). Retry in a few seconds."
+                    )
+
+                # Tool error (or transient non-crash failure). Surface
+                # the failure to the upstream MCP client (Claude Code)
+                # as an error string. Don't touch toolkit state.
+                return f"{upstream_name} failed after {duration:.1f}s: {detail}"
 
         return forward
 
