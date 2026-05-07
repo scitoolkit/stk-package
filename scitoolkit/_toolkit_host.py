@@ -145,6 +145,161 @@ def _import_tools_package(toolkit_dir: Path) -> Any:
     return module
 
 
+def _import_module_no_syspath(
+    dotted: str, toolkit_dir: Path
+) -> Any:
+    """Import a dotted module path resolved against ``toolkit_dir`` without
+    polluting ``sys.path``.
+
+    Supports the explicit-form ``tools:`` entries emitted by
+    ``scitoolkit ingest``. For the same reason as ``_import_tools_package``
+    (HANDOFF gotcha #2 — adding ``toolkit_dir`` to ``sys.path`` lets a
+    toolkit's top-level dirs shadow installed packages of the same name),
+    we resolve and load each module by file path using
+    ``importlib.util.spec_from_file_location``.
+
+    Walks ``dotted`` against the filesystem from ``toolkit_dir``: each
+    segment must either be a sub-package (directory with ``__init__.py``)
+    or, for the leaf, a ``.py`` file.
+
+    Modules are registered under their dotted name so relative imports
+    inside them resolve correctly. Parent packages are loaded
+    transparently the same way.
+
+    Raises ``ImportError`` with a clear message if the module is not
+    reachable from ``toolkit_dir``.
+    """
+    parts = dotted.split('.')
+    if not all(p.isidentifier() for p in parts):
+        raise ImportError(
+            f"invalid dotted module path: {dotted!r}"
+        )
+
+    # Walk packages first.
+    cur_dir = toolkit_dir
+    cur_dotted_parts: list[str] = []
+    for part in parts[:-1]:
+        cur_dotted_parts.append(part)
+        sub = cur_dir / part
+        init = sub / "__init__.py"
+        if not init.is_file():
+            raise ImportError(
+                f"cannot resolve {dotted!r}: "
+                f"{sub} has no __init__.py "
+                f"(walked from {toolkit_dir})"
+            )
+        full_dotted = ".".join(cur_dotted_parts)
+        if full_dotted not in sys.modules:
+            spec = importlib.util.spec_from_file_location(
+                full_dotted,
+                str(init),
+                submodule_search_locations=[str(sub)],
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(
+                    f"could not build module spec for {init}"
+                )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[full_dotted] = mod
+            spec.loader.exec_module(mod)
+        cur_dir = sub
+
+    # Leaf: either a submodule .py, an __init__.py inside a sub-package,
+    # or the dotted path may itself be a package whose attribute we want.
+    leaf = parts[-1]
+    leaf_dotted = ".".join(parts)
+    leaf_pyfile = cur_dir / f"{leaf}.py"
+    leaf_pkg_init = cur_dir / leaf / "__init__.py"
+
+    if leaf_pyfile.is_file():
+        if leaf_dotted in sys.modules:
+            return sys.modules[leaf_dotted]
+        spec = importlib.util.spec_from_file_location(
+            leaf_dotted, str(leaf_pyfile)
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"could not build module spec for {leaf_pyfile}"
+            )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[leaf_dotted] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    if leaf_pkg_init.is_file():
+        if leaf_dotted in sys.modules:
+            return sys.modules[leaf_dotted]
+        spec = importlib.util.spec_from_file_location(
+            leaf_dotted,
+            str(leaf_pkg_init),
+            submodule_search_locations=[str(cur_dir / leaf)],
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"could not build module spec for {leaf_pkg_init}"
+            )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[leaf_dotted] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    raise ImportError(
+        f"cannot find module {dotted!r} under {toolkit_dir}: "
+        f"neither {leaf_pyfile} nor {leaf_pkg_init} exists"
+    )
+
+
+def _import_explicit_tools(
+    tools_spec: list, toolkit_dir: Path
+) -> list:
+    """Load tools listed in the explicit ``tools:`` form.
+
+    ``tools_spec`` is a list of dicts of shape
+    ``{"name": str, "module": str, ...}`` (the ``description`` field is
+    not consumed here — it lives on the toolkit.yaml for human readers
+    and the registry; the runtime tool object's docstring is what
+    Orchestral surfaces to the agent).
+
+    For each entry, imports the module and pulls the named attribute.
+    The attribute is expected to be either:
+
+    - a ``BaseTool`` instance (already-instantiated tool, including
+      ``@define_tool``-decorated functions which the decorator wraps
+      into instances at module load time);
+    - a ``BaseTool`` subclass (we instantiate it with no args);
+
+    Anything else raises a ``TypeError`` with a clear pointer.
+    """
+    from orchestral.tools.base.tool import BaseTool
+    import inspect
+
+    tools: list = []
+    for entry in tools_spec:
+        module_path = entry.get("module")
+        attr_name = entry.get("name")
+        if not module_path or not attr_name:
+            raise ValueError(
+                f"explicit tool entry missing 'module' or 'name': {entry!r}"
+            )
+        mod = _import_module_no_syspath(module_path, toolkit_dir)
+        if not hasattr(mod, attr_name):
+            raise AttributeError(
+                f"module {module_path!r} has no attribute {attr_name!r} "
+                "(named in toolkit.yaml's tools: list)"
+            )
+        obj = getattr(mod, attr_name)
+        if isinstance(obj, BaseTool):
+            tools.append(obj)
+        elif inspect.isclass(obj) and issubclass(obj, BaseTool):
+            tools.append(obj())
+        else:
+            raise TypeError(
+                f"{module_path}.{attr_name} is not a BaseTool instance "
+                f"or subclass; got {type(obj).__name__}. "
+                "Tools must be either @define_tool-decorated functions "
+                "or BaseTool subclasses."
+            )
+    return tools
+
+
 def _collect_tool_instances(tools_module: Any) -> list:
     """Return tool instances exposed by the toolkit's ``tools/__init__.py``.
 
@@ -242,6 +397,18 @@ def main(argv: list[str] | None = None) -> int:
             "Empty for now; populated by Phase 3C's setup system."
         ),
     )
+    parser.add_argument(
+        "--tools-spec",
+        default="",
+        help=(
+            "JSON list of explicit tool entries from toolkit.yaml's "
+            "tools: field, each shaped like "
+            "{'name': str, 'module': str} (explicit form) or "
+            "{'name': str, 'function': str} (implicit form, ignored — "
+            "implicit-form toolkits use tools/__init__.py discovery). "
+            "Empty/absent triggers the implicit fallback."
+        ),
+    )
     args = parser.parse_args(argv)
 
     state_config: dict = {}
@@ -254,24 +421,79 @@ def main(argv: list[str] | None = None) -> int:
             _emit_error(f"invalid --state-config: {e}")
             return 2
 
-    # Import the toolkit's tools.
-    try:
-        tools_module = _import_tools_package(args.toolkit_dir)
-    except Exception as e:
-        _emit_error(
-            f"failed to import tools from {args.toolkit_dir}: {e}",
-            traceback=traceback.format_exc(),
-        )
-        return 3
+    tools_spec: list = []
+    if args.tools_spec:
+        try:
+            tools_spec = json.loads(args.tools_spec)
+            if not isinstance(tools_spec, list):
+                raise ValueError("tools-spec must be a JSON list")
+        except Exception as e:
+            _emit_error(f"invalid --tools-spec: {e}")
+            return 2
 
-    tool_instances = _collect_tool_instances(tools_module)
+    # Import the toolkit's tools. Two modes:
+    #   1) Explicit form: --tools-spec contains entries with 'module' keys.
+    #      We import each module by file-resolution from toolkit_dir.
+    #   2) Implicit form (default / fallback): import tools/__init__.py.
+    #
+    # Mixed yaml is supported by importing both paths and merging.
+    explicit_entries = [
+        e for e in tools_spec
+        if isinstance(e, dict) and e.get("module")
+    ]
+    implicit_entries = [
+        e for e in tools_spec
+        if isinstance(e, dict) and e.get("function")
+    ]
+    use_implicit_discovery = bool(implicit_entries) or not tools_spec
+
+    tool_instances: list = []
+
+    if explicit_entries:
+        try:
+            tool_instances.extend(
+                _import_explicit_tools(explicit_entries, args.toolkit_dir)
+            )
+        except Exception as e:
+            _emit_error(
+                f"failed to import explicit-form tools: {e}",
+                traceback=traceback.format_exc(),
+            )
+            return 3
+
+    if use_implicit_discovery:
+        # Either the toolkit declares implicit-form tools in its yaml, or
+        # tools_spec is empty (legacy / no yaml passthrough). Fall back to
+        # the historical tools/__init__.py discovery.
+        try:
+            tools_module = _import_tools_package(args.toolkit_dir)
+            tool_instances.extend(_collect_tool_instances(tools_module))
+        except Exception as e:
+            if not explicit_entries:
+                _emit_error(
+                    f"failed to import tools from {args.toolkit_dir}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                return 3
+            # Mixed-form: explicit imports succeeded; implicit-side failure
+            # is unexpected but we already have something. Surface a
+            # warning via stderr and proceed.
+            sys.stderr.write(
+                f"[scitoolkit-host] WARN: implicit tools/ discovery "
+                f"failed for mixed-form toolkit: {e}\n"
+            )
+
     if not tool_instances:
         _emit_error(
-            f"no Orchestral tools found in {args.toolkit_dir}/tools/",
+            f"no Orchestral tools found in {args.toolkit_dir}",
             hint=(
-                "Either export a TOOLS list from tools/__init__.py, or "
-                "ensure the package re-exports your @define_tool-decorated "
-                "tools as module attributes."
+                "For the implicit form: export a TOOLS list from "
+                "tools/__init__.py or ensure the package re-exports "
+                "your @define_tool-decorated tools as module "
+                "attributes. For the explicit form: ensure each "
+                "entry's module: dotted path resolves under the "
+                "toolkit root and the named attribute is a BaseTool "
+                "instance or subclass."
             ),
         )
         return 4

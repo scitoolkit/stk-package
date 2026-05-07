@@ -267,6 +267,42 @@ def _resolve_state_config(
 # ── subprocess launch ───────────────────────────────────────────────────
 
 
+def _read_tools_spec(toolkit_path: Path) -> List[Dict[str, Any]]:
+    """Extract the ``tools:`` list from the toolkit's yaml, if present.
+
+    Returns ``[]`` when the yaml is missing, malformed, or carries no
+    ``tools:`` field — the host treats that as "fall back to implicit
+    tools/__init__.py discovery", which is the legacy path. Each
+    returned entry is a dict with at least ``name`` and either
+    ``module`` (explicit form) or ``function`` (implicit form).
+    """
+    yaml_path = toolkit_path / "toolkit.yaml"
+    if not yaml_path.is_file():
+        return []
+    try:
+        import yaml as pyyaml  # PyYAML; bundled with scitoolkit's deps
+        data = pyyaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    tools = data.get("tools")
+    if not isinstance(tools, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for entry in tools:
+        if not isinstance(entry, dict):
+            continue
+        # Pass through only the fields the host consumes.
+        cleaned: Dict[str, Any] = {}
+        for key in ("name", "module", "function", "description"):
+            if key in entry:
+                cleaned[key] = entry[key]
+        if "name" in cleaned and ("module" in cleaned or "function" in cleaned):
+            out.append(cleaned)
+    return out
+
+
 def _build_host_command(
     disc: ToolkitDiscovery,
     *,
@@ -281,11 +317,16 @@ def _build_host_command(
     state_arg = ""
     if state_config:
         state_arg = json.dumps(state_config, ensure_ascii=False)
+    tools_spec = _read_tools_spec(disc.path)
+    tools_spec_arg = ""
+    if tools_spec:
+        tools_spec_arg = json.dumps(tools_spec, ensure_ascii=False)
     base_args = [
         "-m", "scitoolkit._toolkit_host",
         "--toolkit-dir", str(disc.path),
         "--name", disc.name,
         "--state-config", state_arg,
+        "--tools-spec", tools_spec_arg,
     ]
     if disc.env_type == "venv":
         python_exe = disc.meta.get("python_path")

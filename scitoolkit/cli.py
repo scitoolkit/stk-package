@@ -169,7 +169,7 @@ class _SectionedGroup(click.Group):
     COMMAND_SECTIONS = [
         (
             "Authoring & publishing",
-            ["init", "validate", "login", "logout", "whoami", "publish"],
+            ["init", "ingest", "validate", "login", "logout", "whoami", "publish"],
         ),
         (
             "Installing & serving",
@@ -211,7 +211,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.3.0", prog_name="scitoolkit")
+@click.version_option(version="0.4.0", prog_name="scitoolkit")
 def main():
     """
     SciToolkit - Scientific agentic tools made easy
@@ -340,6 +340,142 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Error creating toolkit: {e}", style="red")
         sys.exit(1)
+
+
+@main.command()
+@click.argument(
+    "path",
+    required=False,
+    default=".",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Where to write toolkit.yaml. Default: <PATH>/toolkit.yaml.",
+)
+@click.option(
+    "--force", is_flag=True,
+    help="Overwrite an existing toolkit.yaml without prompting.",
+)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Print discovered tools and the target path; don't write.",
+)
+@_interactive_options
+def ingest(path, output, force, dry_run, yes, no_, no_input):
+    """
+    Generate a toolkit.yaml from an existing codebase.
+
+    Walks the given directory (default: cwd), discovers tools via
+    @define_tool decorators and BaseTool subclass detection, and
+    writes a toolkit.yaml skeleton with explicit import paths. Pure
+    static analysis — never imports the modules being scanned.
+
+    Use this to onboard an existing scientific codebase as a
+    scitoolkit toolkit without restructuring or copy-pasting code.
+
+    Example:
+        cd ~/code/heptapod
+        scitoolkit ingest
+
+    The author's code stays where it is. The emitted yaml lists each
+    tool by import path. Edit the metadata fields, write
+    requirements.txt, then run scitoolkit validate and publish.
+    """
+    from .ingest import ingest as run_ingest
+
+    root = Path(path).resolve()
+    target = (output if output else root / "toolkit.yaml")
+    if not isinstance(target, Path):
+        target = Path(target)
+    target = target.resolve()
+
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    # Decide overwrite policy.
+    overwrite = bool(force or yes)
+    existing_at_target = target.is_file()
+    if existing_at_target and not overwrite and not dry_run:
+        rel = target if not target.is_relative_to(root) else target.relative_to(root)
+        question = f"toolkit.yaml exists at {rel}. Overwrite?"
+        approved = _confirm(
+            question,
+            mode=mode,
+            default=False,
+            consequential=True,
+        )
+        if approved:
+            overwrite = True
+
+    try:
+        result = run_ingest(
+            root=root,
+            output=output if output else None,
+            overwrite=overwrite,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        console.print(f"[bold red]✗[/bold red] Ingest failed: {e}", style="red")
+        sys.exit(1)
+
+    # Refuse-to-overwrite path.
+    if result.overwrite_blocked:
+        console.print(
+            f"[bold red]✗[/bold red] toolkit.yaml exists at "
+            f"{result.target}; refusing to overwrite. "
+            "Re-run with --force or --yes to replace it.",
+            style="red",
+        )
+        sys.exit(1)
+
+    # Summary output.
+    fn_descriptors = [t for t in result.tools if t.kind == "function"]
+    cls_descriptors = [t for t in result.tools if t.kind == "class"]
+
+    console.print(f"[bold cyan]Scanning[/bold cyan] {root}...")
+    console.print(
+        f"Found [bold]{len(result.tools)}[/bold] tools "
+        f"across [bold]{len({t.module for t in result.tools})}[/bold] modules."
+    )
+    if fn_descriptors:
+        console.print(
+            f"\n[cyan]Decorated functions ({len(fn_descriptors)}):[/cyan]"
+        )
+        for t in fn_descriptors:
+            console.print(f"  {t.module}.{t.name}")
+    if cls_descriptors:
+        console.print(
+            f"\n[cyan]BaseTool subclasses ({len(cls_descriptors)}):[/cyan]"
+        )
+        for t in cls_descriptors:
+            console.print(f"  {t.module}.{t.name}")
+
+    if dry_run:
+        console.print(
+            f"\n[dim](--dry-run; would write to {result.target})[/dim]"
+        )
+        return
+
+    if result.wrote:
+        console.print(f"\n[bold green]✓[/bold green] Wrote {result.target}.")
+    if not result.requirements_present:
+        console.print(
+            "[yellow]WARNING:[/yellow] requirements.txt not found. "
+            "Create one before scitoolkit publish."
+        )
+    console.print("\n[bold]Next steps:[/bold]")
+    console.print(
+        "  - Edit toolkit.yaml metadata "
+        "(name, version, category, description, author)."
+    )
+    if not result.requirements_present:
+        console.print(
+            "  - Create requirements.txt listing your toolkit's "
+            "Python dependencies."
+        )
+    console.print("  - Run [cyan]scitoolkit validate[/cyan].")
 
 
 @main.command()

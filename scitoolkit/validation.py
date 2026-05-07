@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, field_validator, EmailStr
+from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 import yaml
 
 
@@ -126,10 +126,53 @@ def _check_skill_frontmatter(skill_path: Path) -> Optional[str]:
 
 
 class ToolDefinition(BaseModel):
-    """Definition of a single tool in the toolkit."""
+    """Definition of a single tool in the toolkit.
+
+    Two mutually-exclusive forms (locked 2026-05-07; see
+    docs/INGEST_DESIGN.md and the ingest sketch sign-off):
+
+    - **Implicit form** (default for ``scitoolkit init``): ``function``
+      is a dotted path INTO the toolkit's ``tools/`` package
+      (e.g. ``tools.my_tool.my_tool``). Tools are discovered through
+      the ``tools/__init__.py`` package import. ``description`` is
+      required.
+
+    - **Explicit form** (emitted by ``scitoolkit ingest``): ``module``
+      is an arbitrary dotted import path resolved against the toolkit
+      root (e.g. ``heptapod.scattering.amplitudes``). The host imports
+      the module, looks up the named attribute, and registers it.
+      ``description`` is optional and falls back to the function or
+      class docstring at serve time.
+
+    Validation enforces ``function`` xor ``module`` — exactly one. Both
+    forms can coexist within the same yaml in principle; in practice
+    each toolkit picks one and stays consistent.
+    """
     name: str = Field(..., description="Tool name (alphanumeric and underscores only)")
-    function: str = Field(..., description="Python function path (e.g., tools.my_tool)")
-    description: str = Field(..., description="Brief description of what the tool does")
+    function: Optional[str] = Field(
+        default=None,
+        description=(
+            "Implicit form: dotted path into the toolkit's tools/ "
+            "package (e.g. 'tools.my_tool')."
+        ),
+    )
+    module: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit form: dotted import path resolved against the "
+            "toolkit root (e.g. 'heptapod.scattering.amplitudes'). "
+            "Mutually exclusive with 'function'. Emitted by "
+            "scitoolkit ingest."
+        ),
+    )
+    description: Optional[str] = Field(
+        default=None,
+        description=(
+            "Brief description of the tool. Required for the implicit "
+            "form. Optional for the explicit form (falls back to "
+            "docstring at serve time)."
+        ),
+    )
 
     @field_validator('name')
     @classmethod
@@ -138,6 +181,28 @@ class ToolDefinition(BaseModel):
         if not v.replace('_', '').replace('-', '').isalnum():
             raise ValueError('Tool name must be alphanumeric (underscores and hyphens allowed)')
         return v
+
+    @model_validator(mode="after")
+    def _exactly_one_form(self):
+        """Enforce ``function`` xor ``module`` and per-form description rules."""
+        has_function = self.function is not None and self.function != ""
+        has_module = self.module is not None and self.module != ""
+        if has_function and has_module:
+            raise ValueError(
+                f"tool '{self.name}' declares both 'function' and 'module'; "
+                "pick one (function for implicit form, module for explicit form)"
+            )
+        if not has_function and not has_module:
+            raise ValueError(
+                f"tool '{self.name}' needs either 'function' (implicit form) "
+                "or 'module' (explicit form)"
+            )
+        if has_function and not self.description:
+            raise ValueError(
+                f"tool '{self.name}' uses the implicit form ('function'); "
+                "'description' is required"
+            )
+        return self
 
 
 class ToolkitMetadata(BaseModel):
@@ -363,29 +428,42 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
         if not file_path.exists():
             result.warnings.append(f"Missing recommended file: {filename}")
 
-    # Check for tools directory
+    # Check for tools/ directory.
+    #
+    # The implicit form (``function:`` field, current ``init`` template
+    # default) requires ``tools/__init__.py``. The explicit form
+    # (``module:`` field, emitted by ``scitoolkit ingest``) imports
+    # arbitrary dotted paths against the toolkit root and does not need
+    # ``tools/`` to exist. If ALL tools are explicit-form, skip the
+    # ``tools/`` requirement; otherwise require it.
+    has_implicit_tools = any(
+        getattr(t, 'function', None) for t in metadata.tools
+    )
+    has_explicit_tools = any(
+        getattr(t, 'module', None) for t in metadata.tools
+    )
     tools_dir = toolkit_path / "tools"
-    if not tools_dir.exists():
-        result.is_valid = False
-        result.errors.append("Missing required directory: tools/")
-        return result
-
-    # Check that tools directory has __init__.py
-    init_file = tools_dir / "__init__.py"
-    if not init_file.exists():
-        result.is_valid = False
-        result.errors.append("Missing required file: tools/__init__.py (Orchestral requires explicit tool exports)")
-    else:
-        # Check that tools/__init__.py exports tools
-        try:
-            content = init_file.read_text()
-            if '__all__' not in content and 'import' not in content:
-                result.warnings.append(
-                    "tools/__init__.py should export tools. "
-                    "Add: from tools.your_tool import your_tool"
-                )
-        except Exception:
-            pass
+    if has_implicit_tools:
+        if not tools_dir.exists():
+            result.is_valid = False
+            result.errors.append("Missing required directory: tools/")
+            return result
+        # Check that tools directory has __init__.py
+        init_file = tools_dir / "__init__.py"
+        if not init_file.exists():
+            result.is_valid = False
+            result.errors.append("Missing required file: tools/__init__.py (Orchestral requires explicit tool exports)")
+        else:
+            # Check that tools/__init__.py exports tools
+            try:
+                content = init_file.read_text()
+                if '__all__' not in content and 'import' not in content:
+                    result.warnings.append(
+                        "tools/__init__.py should export tools. "
+                        "Add: from tools.your_tool import your_tool"
+                    )
+            except Exception:
+                pass
 
     # Check for MCP server files (required for Orchestral integration)
     mcp_dir = toolkit_path / "mcp"
@@ -400,25 +478,99 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
                 result.is_valid = False
                 result.errors.append(f"Missing required MCP file: mcp/{filename}")
 
-    # Check that tool files exist
+    # Per-tool existence checks. Branches per form (function: vs module:).
+    seen_keys: set = set()
+    requirements_text = ""
+    requirements_file_for_check = toolkit_path / "requirements.txt"
+    if requirements_file_for_check.exists():
+        try:
+            requirements_text = requirements_file_for_check.read_text().lower()
+        except Exception:
+            requirements_text = ""
+
     for tool in metadata.tools:
-        # Parse function path (e.g., "tools.my_tool" -> "tools/my_tool.py")
-        function_parts = tool.function.split('.')
-
-        if len(function_parts) < 2:
-            result.errors.append(f"Invalid function path for tool '{tool.name}': {tool.function}")
+        # Duplicate check: implicit by (function, name); explicit by
+        # (module, name). Cross-form ``name`` collisions are also flagged.
+        key = (tool.function or tool.module, tool.name)
+        if key in seen_keys:
             result.is_valid = False
+            result.errors.append(
+                f"Duplicate tool entry: name='{tool.name}' "
+                f"({'function' if tool.function else 'module'}="
+                f"'{tool.function or tool.module}')"
+            )
             continue
+        seen_keys.add(key)
 
-        # Check if the module file exists
-        module_path = toolkit_path / f"{function_parts[0]}.py"
-        if not module_path.exists():
-            # Try as a package
-            module_path = toolkit_path / function_parts[0] / f"{function_parts[1]}.py"
-            if not module_path.exists():
-                result.warnings.append(
-                    f"Tool file not found for '{tool.name}': {function_parts[0]}/{function_parts[1]}.py"
+        if tool.function:
+            # Implicit form: dotted path into tools/ package; check the
+            # corresponding source file exists.
+            function_parts = tool.function.split('.')
+            if len(function_parts) < 2:
+                result.errors.append(
+                    f"Invalid function path for tool '{tool.name}': {tool.function}"
                 )
+                result.is_valid = False
+                continue
+            module_path = toolkit_path / f"{function_parts[0]}.py"
+            if not module_path.exists():
+                module_path = toolkit_path / function_parts[0] / f"{function_parts[1]}.py"
+                if not module_path.exists():
+                    result.warnings.append(
+                        f"Tool file not found for '{tool.name}': "
+                        f"{function_parts[0]}/{function_parts[1]}.py"
+                    )
+        elif tool.module:
+            # Explicit form: dotted import path. Verify the module
+            # resolves to a file inside the toolkit root, OR the top-level
+            # package is declared as a dep in requirements.txt.
+            #
+            # We don't use ``importlib.util.find_spec`` here — that runs
+            # parent-package ``__init__.py`` code as a side effect of
+            # locating the spec. Walking the filesystem ourselves is
+            # cheap and side-effect-free.
+            parts = tool.module.split('.')
+            if not all(p.isidentifier() for p in parts):
+                result.is_valid = False
+                result.errors.append(
+                    f"Invalid module path for tool '{tool.name}': "
+                    f"'{tool.module}' is not a valid dotted identifier"
+                )
+                continue
+            # Try resolving against the toolkit root.
+            candidate_dir_init = toolkit_path
+            candidate_file = toolkit_path
+            resolved_inside = False
+            cur = toolkit_path
+            for i, part in enumerate(parts):
+                pkg = cur / part
+                pyfile = cur / f"{part}.py"
+                if i == len(parts) - 1:
+                    if pyfile.is_file() or (pkg / "__init__.py").is_file():
+                        resolved_inside = True
+                        break
+                    # Last part not found → unresolved.
+                    break
+                else:
+                    if (pkg / "__init__.py").is_file():
+                        cur = pkg
+                        continue
+                    # No further package; can't resolve under root.
+                    break
+            if not resolved_inside:
+                top_level = parts[0].lower()
+                # Cheap requirements.txt presence check; matches "name",
+                # "name>=...", "name==...", etc. as a substring.
+                if top_level not in requirements_text:
+                    result.is_valid = False
+                    result.errors.append(
+                        f"Tool '{tool.name}' references module "
+                        f"'{tool.module}' which is not under the toolkit "
+                        f"root and the top-level package '{parts[0]}' "
+                        "is not declared in requirements.txt. The tarball "
+                        "wouldn't include this code; declare the dep or "
+                        "move the source under the toolkit root."
+                    )
 
     # Validate requirements.txt if it exists
     requirements_file = toolkit_path / "requirements.txt"

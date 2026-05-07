@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.4.0] — 2026-05-07
+
+The ingest release. `scitoolkit ingest` lets authors with existing scientific codebases generate a `toolkit.yaml` from their repo without restructuring their code or maintaining a hand-edited `tools/__init__.py` mirror. The yaml gains a new explicit form (`module:` import paths) alongside the existing implicit form (`function:` paths into `tools/`); both are supported forever. Driven by HEPTAPOD's first-real-world-toolkit porting case.
+
+### Added
+
+- **`scitoolkit ingest [PATH]` command.** Walks an existing repo, AST-parses every `.py` file, detects tools via `@define_tool` decorators and `BaseTool` subclasses, and emits a `toolkit.yaml` skeleton with explicit import paths. Pure static analysis — never imports the modules being scanned. Honors `.gitignore`, skips `tests/`, `__pycache__`, `.venv`, build dirs, and hidden files. Flags: `--output/-o`, `--force`, `--dry-run`, plus the standard `--yes/--no/--no-input` interactive set. Author keeps their code where it is; the yaml is the manifest.
+- **Explicit `tools:` form in `toolkit.yaml`.** Each entry can declare `module: <dotted-path>` (resolved against the toolkit root) and `name: <attr>` instead of the existing `function: tools.foo.bar`. `description:` becomes optional in this form (falls back to the function/class docstring). Both forms coexist within the same yaml; in practice each toolkit picks one.
+- **Validation rules for the new form.** Mutually-exclusive `function` xor `module`. Duplicate-entry detection by `(module, name)` or `(function, name)` pair. Path-residence check: explicit-form modules must resolve to a file under the toolkit root OR appear as a top-level dep in `requirements.txt` (the tarball wouldn't include them otherwise; loud-failure at validate time, not silent at install time).
+- **Per-toolkit host explicit-form imports** (`scitoolkit/_toolkit_host.py::_import_module_no_syspath`). Imports each declared module by file resolution against the toolkit root using `importlib.util.spec_from_file_location` — no `sys.path` mutation. Same discipline as the existing `tools/__init__.py` import path, for the same reason (HANDOFF gotcha #2: top-level dirs in toolkits can shadow installed packages of the same name).
+
+### Changed
+
+- **`tools:` field schema is a discriminated union.** `ToolDefinition` accepts either `{name, function, description}` (implicit form, the existing shape) or `{name, module, description?}` (explicit form, new). Pydantic model validator enforces exactly one form per entry. Backward-compatible: every existing toolkit yaml still validates and serves unchanged.
+- **`tools/` directory is no longer required for all-explicit-form toolkits.** Toolkits whose `tools:` list is entirely explicit-form (`module:` entries) skip the historical `tools/__init__.py` requirement. Mixed-form and all-implicit-form toolkits still require it.
+- **Orchestrator passes `--tools-spec` to the per-toolkit host.** The orchestrator parses each toolkit's `toolkit.yaml` at spawn time and forwards the parsed `tools:` list to `_toolkit_host.py` as a JSON arg. Empty/absent triggers the implicit fallback path; non-empty drives explicit-form imports. No dependency added to the toolkit-env; the orchestrator's host already has PyYAML.
+
+### Internal
+
+- New module: `scitoolkit/ingest.py` (~440 LOC). `ToolDescriptor`, gitignore-aware walker, AST-only decorator/subclass detection (handles aliasing, attribute-access, `TYPE_CHECKING` exclusion, nested-scope exclusion), comment-preserving yaml emission via `ruamel.yaml`.
+- New tests: `test_ingest_walker.py` (16 cases), `test_ingest_ast.py` (28 cases), `test_ingest_yaml_emit.py` (16 cases), `test_ingest_command.py` (10 cases), `test_validation_explicit_tools.py` (14 cases), `test_toolkit_host_explicit_tools.py` (14 cases). 98 new unit tests; 647 total green.
+- New e2e: `tests/e2e/run_ingest_e2e.py` against `test-existing-repo-fixture/` — synthetic HEPTAPOD-shaped repo (decorated functions in 2 modules + a BaseTool subclass + non-tool helpers + a `.gitignore` pattern + a `tests/` dir to skip). Drives ingest → patch metadata → validate → host-import end-to-end.
+- HANDOFF gotcha #2 unchanged but now also covers the explicit-form case: explicit imports use `spec_from_file_location` with a per-module `submodule_search_locations` argument, never `sys.path.insert`.
+
+---
+
 ## [0.3.0] — 2026-05-06
 
 The configuration system. Toolkits with API keys, downloadable data, and derived state now work end-to-end. The full create → publish → install → setup → serve loop is live for the broadest class of toolkits we've supported. ASTER-class workflows — multi-GB downloads, hardware detection, custom setup logic — are now wireable.
