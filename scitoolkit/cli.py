@@ -169,7 +169,7 @@ class _SectionedGroup(click.Group):
     COMMAND_SECTIONS = [
         (
             "Authoring & publishing",
-            ["init", "ingest", "validate", "login", "logout", "whoami", "publish"],
+            ["create", "init", "ingest", "validate", "login", "logout", "whoami", "publish"],
         ),
         (
             "Installing & serving",
@@ -211,7 +211,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.4.0", prog_name="scitoolkit")
+@click.version_option(version="0.4.1", prog_name="scitoolkit")
 def main():
     """
     SciToolkit - Scientific agentic tools made easy
@@ -219,6 +219,195 @@ def main():
     A platform for creating, publishing, and using AI tools for science.
     """
     pass
+
+
+@main.command()
+@click.argument("name")
+@click.option(
+    "--category", "-c", required=True,
+    help=(
+        "Toolkit category (e.g. astro, hep, quantum). Validated against "
+        "the registry's category list."
+    ),
+)
+@click.option(
+    "--description", "-d", required=True,
+    help="One-line description of what the toolkit does.",
+)
+@click.option(
+    "--organization",
+    default=None,
+    help=(
+        "Organization name (optional; reserved for future org support). "
+        "Currently ignored by the registry."
+    ),
+)
+@click.option(
+    "--version",
+    default="0.1.0",
+    help="Initial version string (default: 0.1.0).",
+)
+@_interactive_options
+def create(name, category, description, organization, version, yes, no_, no_input):
+    """
+    Create a new toolkit row in the registry.
+
+    Registers a toolkit name, category, and description against
+    api.scitoolkit.org under the authenticated user. Use this before
+    `scitoolkit init <name>` (to scaffold a fresh local toolkit dir)
+    or `scitoolkit ingest .` (to onboard an existing codebase).
+
+    Requires a per-user CLI token (run `scitoolkit login` first).
+
+    Example:
+        scitoolkit create heptapod --category hep --description "HEP toolkit"
+        scitoolkit create my-toolkit -c astro -d "Astro tools"
+    """
+    import requests
+    from .auth import load_user_token
+    from .validation import get_allowed_categories
+
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    # 1. Auth check.
+    token = load_user_token()
+    if not token:
+        console.print(
+            "[bold red]✗[/bold red] Not logged in. "
+            "Run [cyan]scitoolkit login[/cyan] first to authenticate.",
+            style="red",
+        )
+        sys.exit(1)
+
+    # 2. Local validation. Backend re-validates, but loud-failure here
+    # avoids a network round-trip for obvious mistakes.
+    name_l = name.strip().lower()
+    if not name_l.replace("-", "").replace("_", "").isalnum():
+        console.print(
+            f"[bold red]✗[/bold red] Invalid toolkit name: {name!r}. "
+            "Use lowercase alphanumeric + hyphens/underscores only.",
+            style="red",
+        )
+        sys.exit(1)
+    if len(name_l) < 3:
+        console.print(
+            f"[bold red]✗[/bold red] Toolkit name must be at least 3 characters: {name!r}",
+            style="red",
+        )
+        sys.exit(1)
+
+    try:
+        allowed_categories = get_allowed_categories()
+    except Exception:
+        # get_allowed_categories already falls back silently; this is
+        # belt-and-suspenders.
+        allowed_categories = None
+    if allowed_categories and category not in allowed_categories:
+        console.print(
+            f"[bold red]✗[/bold red] Invalid category: {category!r}. "
+            f"Allowed: {', '.join(sorted(allowed_categories))}",
+            style="red",
+        )
+        sys.exit(1)
+
+    if len(description) > 200:
+        console.print(
+            f"[bold red]✗[/bold red] Description too long "
+            f"({len(description)} chars; limit 200).",
+            style="red",
+        )
+        sys.exit(1)
+
+    # 3. Hit the registry.
+    api_url = os.environ.get("SCITOOLKIT_API_URL", "https://api.scitoolkit.org")
+    create_url = f"{api_url}/api/toolkits"
+    body = {
+        "name": name_l,
+        "category": category,
+        "description": description,
+        "version": version,
+    }
+    if organization:
+        # The endpoint doesn't currently honor this; pass it anyway so
+        # backend can pick it up if/when it adds support without a CLI
+        # bump.
+        body["organization"] = organization
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    console.print(
+        f"Creating toolkit [cyan]{name_l}[/cyan] in [cyan]{category}[/cyan]..."
+    )
+    try:
+        response = requests.post(create_url, json=body, headers=headers, timeout=15)
+    except requests.exceptions.RequestException as e:
+        console.print(
+            f"[bold red]✗[/bold red] Could not reach registry: {e}",
+            style="red",
+        )
+        sys.exit(1)
+
+    if response.status_code == 401:
+        console.print(
+            "[bold red]✗[/bold red] Token rejected by registry. "
+            "Run [cyan]scitoolkit login[/cyan] to refresh.",
+            style="red",
+        )
+        sys.exit(1)
+    if response.status_code == 409:
+        console.print(
+            f"[bold red]✗[/bold red] Toolkit name {name_l!r} is already taken.",
+            style="red",
+        )
+        sys.exit(1)
+    if response.status_code == 422:
+        # FastAPI's validation envelope.
+        try:
+            details = response.json().get("detail", "")
+        except Exception:
+            details = response.text
+        console.print(
+            f"[bold red]✗[/bold red] Registry rejected the request:\n  {details}",
+            style="red",
+        )
+        sys.exit(1)
+    if not (200 <= response.status_code < 300):
+        console.print(
+            f"[bold red]✗[/bold red] Registry returned "
+            f"HTTP {response.status_code}: {response.text[:200]}",
+            style="red",
+        )
+        sys.exit(1)
+
+    # The endpoint returns {id, name, token}. The token is a legacy
+    # per-toolkit publish token; we deliberately don't save it. The
+    # user's per-user CLI token already covers publish via
+    # auth.load_token_for_publish, and surfacing or persisting the
+    # legacy token would just create another credential to manage.
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    created_name = payload.get("name", name_l)
+
+    console.print(
+        f"\n[bold green]✓[/bold green] Toolkit "
+        f"[cyan]{created_name}[/cyan] created."
+    )
+    console.print("\n[bold]Next steps:[/bold]")
+    console.print(
+        f"  - [cyan]scitoolkit init {created_name}[/cyan] "
+        "(scaffold a fresh local toolkit directory), or"
+    )
+    console.print(
+        f"  - [cyan]cd[/cyan] into your existing codebase and "
+        f"run [cyan]scitoolkit ingest .[/cyan] (emit a "
+        "toolkit.yaml from existing tools)."
+    )
+    console.print(
+        f"  - Then [cyan]scitoolkit validate[/cyan] and "
+        f"[cyan]scitoolkit publish[/cyan]."
+    )
 
 
 @main.command()

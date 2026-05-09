@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.4.1] — TBD (in tree, not yet shipped)
+
+Bundle of two coherent pieces of work, neither big enough to warrant its own release: CLI-driven toolkit creation (eliminating the website round-trip from the agent-onboarding flow), and Orchestral 1.4 stdio MCPClient cleanup (retiring the ~150-200 LOC HTTP-loopback machinery in `serve/orchestrator.py` now that Orchestral 1.4's persistent stdio client makes it unnecessary).
+
+### Added
+
+- **`scitoolkit create <name>` command.** Registers a new toolkit row at the registry from the CLI without a website round-trip. Required flags: `--category/-c`, `--description/-d`. Optional: `--organization` (passed through; reserved for future org support), `--version` (default `0.1.0`). Authenticates via the per-user CLI token in `~/.scitoolkit/token`; prints a clear "run scitoolkit login first" pointer if no token. Local validation runs before any network call (name format, length, category whitelist via `get_allowed_categories()`, description length). On success, prints next-step pointers for both `scitoolkit init <name>` (scaffold a fresh dir) and `scitoolkit ingest .` (onboard existing code). Lands in the "Authoring & publishing" section alongside `init`, `ingest`, `validate`, `publish`. The legacy per-toolkit token returned by the registry is intentionally not persisted — `auth.load_token_for_publish()` already resolves the per-user token first, so saving the legacy token would just create another credential to manage.
+
+### Changed
+
+- **Per-toolkit serve transport: HTTP loopback → MCP stdio.** The orchestrator now drives each per-toolkit subprocess via Orchestral 1.4's persistent stdio `MCPClient(server_command=[...])` instead of spawning a `Popen` and connecting an `MCPClient(url=...)` to a FastMCP HTTP loopback server. The wire is the subprocess's own stdin/stdout pipe; there is no port, no handshake JSON line, no port-bind race, no `/mcp` URL. Wire shift is invisible to toolkit authors and to the agent (Claude Code) — the upstream MCP stdio surface is unchanged. Internal-only architectural change.
+- **Per-toolkit stderr capture: orchestrator `Popen(stderr=PIPE)` pump → host-side direct write.** Pre-0.4.1 the orchestrator captured the host's stderr via a pipe and pumped it to `~/.scitoolkit/logs/<toolkit>.log` from a daemon thread. With Orchestral 1.4's `MCPClient` owning the `Popen` lifecycle, the orchestrator no longer holds the stderr handle. The host now opens the same log path directly via the new `SCITOOLKIT_HOST_LOG` env var (passed by the orchestrator at spawn time) and redirects its own `sys.stderr` to it at startup. Same destination, same per-toolkit log file, simpler plumbing. Sentinel test (`test_host_stderr_capture.py`) pins the routing.
+- **Crash detection: `proc.poll()` → `MCPClient._subprocess_died`.** Pre-0.4.1 the orchestrator polled the subprocess via its `Popen` handle to detect crashes; post-cleanup the canonical signal is `MCPSubprocessDiedError` raised by `MCPClient.call_tool` after the persistent-session loop sees the connection drop, with `client._subprocess_died` as the underlying flag. The restart state machine is otherwise unchanged.
+
+### Internal
+
+- Retired ~250 LOC of HTTP-loopback machinery from `serve/orchestrator.py` and `_toolkit_host.py`: `_find_free_loopback_port`, `_emit_handshake`, `_read_handshake`, `_wait_for_port_ready`, `_start_stderr_pump`, the `_kill` Popen-reaping helper, FastMCP server construction. `ToolkitRuntime` lost `proc`, `port`, `stderr_thread`, `stderr_logfile_handle` fields.
+- Two HANDOFF gotchas retired: #1 (`/mcp` URL trailing slash) and #11 (host port-bind race). Both are gone with the HTTP loopback. Historical entries kept in HANDOFF.md so future revivers re-read the original incidents before reintroducing the URL.
+- New module-level constant `SCITOOLKIT_HOST_LOG` is the env-var contract between orchestrator and host for log routing. Set by `_build_host_env` to `~/.scitoolkit/logs/<toolkit>.log`; consumed by `_redirect_stderr_to_log` at host startup.
+- Sentinel test `test_host_stderr_capture.py` covers the redirect: env-set → file capture works, env-unset → stderr unchanged, unwritable path → graceful no-op.
+- Deleted `tests/test_orchestrator_url_no_slash.py` (the URL is gone; no slash to sentinel).
+- 698 unit tests green (Item 1 added 16, Item 2 added 3, sentinel deletion subtracted 2; baseline 681).
+
+---
+
 ## [0.4.0] — 2026-05-07
 
 The ingest release. `scitoolkit ingest` lets authors with existing scientific codebases generate a `toolkit.yaml` from their repo without restructuring their code or maintaining a hand-edited `tools/__init__.py` mirror. The yaml gains a new explicit form (`module:` import paths) alongside the existing implicit form (`function:` paths into `tools/`); both are supported forever. Driven by HEPTAPOD's first-real-world-toolkit porting case.

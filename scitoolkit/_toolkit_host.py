@@ -3,8 +3,18 @@ Per-toolkit subprocess host for ``scitoolkit serve``.
 
 This module is the entrypoint that runs *inside* a toolkit's own Python
 interpreter (its venv or conda env). The orchestrator process spawns one of
-these per active toolkit and talks to it over MCP-over-HTTP on a loopback
-port.
+these per active toolkit and talks to it over MCP **stdio** (Orchestral
+1.4's persistent-stdio MCPClient owns the subprocess lifecycle). Prior
+to 0.4.1 this used HTTP loopback with FastMCP; the cleanup landed when
+Orchestral 1.4 made persistent stdio reliable.
+
+Stdin/stdout are reserved for the MCP wire — this module MUST NEVER
+write to stdout (that corrupts the MCP byte stream). All host output —
+diagnostics, import errors, runtime tracebacks — goes to stderr. The
+orchestrator passes a per-toolkit log path via the
+``SCITOOLKIT_HOST_LOG`` env var; we redirect stderr to that file at
+startup so MCPClient's stderr forwarding (whatever it does on its end)
+doesn't matter — we never write to the inherited stderr.
 
 Why this lives in the scitoolkit package: every installed toolkit has
 ``orchestral-ai`` and ``mcp`` in its environment (we install them at toolkit
@@ -56,23 +66,44 @@ import argparse
 import importlib
 import importlib.util
 import json
-import socket
+import os
 import sys
 import traceback
 from pathlib import Path
 from typing import Any, Iterable
 
 
-def _find_free_loopback_port() -> int:
-    """Bind to 127.0.0.1:0, get the kernel-allocated port, release it.
+def _redirect_stderr_to_log() -> None:
+    """Redirect this process's stderr to ``$SCITOOLKIT_HOST_LOG`` if set.
 
-    Tiny race between releasing here and re-binding inside FastMCP, but on
-    loopback in practice this is fine.
+    The orchestrator opens (or pre-creates) a per-toolkit log file at
+    ``~/.scitoolkit/logs/<toolkit>.log`` and passes its path via this
+    env var. We replace ``sys.stderr`` with a line-buffered append-mode
+    handle to that file so:
+
+    1. Anything Python or imported libraries write to stderr lands in
+       the per-toolkit log file rather than being interleaved with the
+       orchestrator's own stderr.
+    2. MCPClient's subprocess stderr forwarding (which by default routes
+       to the orchestrator's stderr) is moot — we never write to the
+       inherited stderr after this redirect.
+
+    No-op when the env var is unset (development scenarios — e.g.,
+    running ``python -m scitoolkit._toolkit_host`` by hand for
+    debugging).
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    return port
+    log_path = os.environ.get("SCITOOLKIT_HOST_LOG")
+    if not log_path:
+        return
+    try:
+        # Line-buffered append so each diagnostic line flushes
+        # immediately; the orchestrator can tail the file in real time.
+        log_fh = open(log_path, "a", buffering=1, encoding="utf-8")
+    except OSError:
+        # Can't open the log; leave stderr as-is. Better to keep
+        # working than to crash on a logging-only failure.
+        return
+    sys.stderr = log_fh
 
 
 def _import_tools_package(toolkit_dir: Path) -> Any:
@@ -349,31 +380,32 @@ def _inject_state_into_tools(tools: list, state_config: dict) -> None:
             tool._setup()
 
 
-def _emit_handshake(port: int, tool_names: list[str]) -> None:
-    """Write the handshake JSON line to stdout and flush.
-
-    The orchestrator reads exactly one line from this subprocess's stdout
-    before connecting its MCP client. After this line, stdout is unused —
-    further diagnostics go to stderr (which the orchestrator captures into
-    ``~/.scitoolkit/logs/<toolkit>.log``).
-    """
-    sys.stdout.write(json.dumps({"port": port, "tools": tool_names}) + "\n")
-    sys.stdout.flush()
-
-
 def _emit_error(message: str, **fields) -> None:
-    """Write a startup-failure handshake and exit non-zero.
+    """Write a startup-failure JSON line to stderr and let the caller exit.
 
-    The orchestrator reads this same single-line slot when waiting for the
-    handshake — it distinguishes success (``port`` key present) from failure
+    With stdio MCP, the orchestrator distinguishes "host startup failed"
+    from "host running normally" by whether ``MCPClient.connect()``
+    succeeded. The orchestrator then reads recent lines from the
+    per-toolkit log file to surface the underlying error to the user.
+    Format here is JSON-on-stderr (one line) so the orchestrator can
+    parse the most recent failure structurally if it wants.
+
+    Pre-0.4.1, this same function wrote to stdout as part of the HTTP
+    handshake; with stdio that would corrupt the MCP wire.
     (``error`` key present) and surfaces the error to the user.
     """
     payload = {"error": message, **fields}
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
+    sys.stderr.write(json.dumps(payload) + "\n")
+    sys.stderr.flush()
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Redirect stderr to ~/.scitoolkit/logs/<toolkit>.log BEFORE doing
+    # anything else. From this point on, sys.stderr writes go to the
+    # log file; nothing of ours ever lands on stdout (which is the
+    # MCP wire) or the inherited stderr (which we don't control).
+    _redirect_stderr_to_log()
+
     parser = argparse.ArgumentParser(
         prog="python -m scitoolkit._toolkit_host",
         description="Per-toolkit subprocess host for scitoolkit serve.",
@@ -387,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--name",
         required=True,
-        help="Toolkit name (used in the FastMCP server name).",
+        help="Toolkit name (used in the MCPServer name).",
     )
     parser.add_argument(
         "--state-config",
@@ -508,9 +540,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 5
 
-    # Build the FastMCP HTTP server.
+    # Build the stdio MCP server. As of 0.4.1 we use Orchestral 1.4's
+    # ``MCPServer`` which wraps the MCP SDK's ``stdio_server``; the
+    # orchestrator owns the subprocess lifecycle via
+    # ``MCPClient(server_command=...)`` and talks to us over the
+    # process's stdin/stdout pipe.
     try:
-        from orchestral.mcp import create_fastmcp_server
+        from orchestral.mcp import MCPServer
     except ImportError as e:
         _emit_error(
             "orchestral.mcp not available — toolkit env missing 'mcp' dep",
@@ -518,32 +554,28 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 6
 
-    port = _find_free_loopback_port()
-
-    mcp = create_fastmcp_server(
-        tool_instances,
+    server = MCPServer(
+        tools=tool_instances,
         name=f"scitoolkit-{args.name}",
-        host="127.0.0.1",
-        port=port,
-        # Use snake_case names; the orchestrator does its own namespacing
-        # with double-underscore prefixes, so we don't want a separate
-        # PascalCase rename layered on top.
+        # Snake_case names — the orchestrator does its own namespacing
+        # with double-underscore prefixes; a separate PascalCase rename
+        # layered on top would make the agent-visible names confusing.
         use_display_names=False,
     )
 
-    tool_names = [t.get_name() for t in tool_instances]
-    _emit_handshake(port, tool_names)
-
-    # Block here. anyio.run inside FastMCP handles the event loop.
+    # Block on the stdio loop. The MCPClient on the orchestrator side
+    # tears us down by closing stdin / sending SIGTERM at session end.
     try:
-        mcp.run(transport="streamable-http")
+        server.run()
     except KeyboardInterrupt:
         return 0
     except Exception:
-        # Log the traceback to stderr so the orchestrator can pick it up
-        # from the per-toolkit log file. We don't try to emit a JSON error
-        # here because the handshake is already past.
-        traceback.print_exc()
+        # Runtime failure after MCP init — log the traceback so the
+        # orchestrator can surface it. We don't write a JSON error
+        # line here because the orchestrator detects "subprocess
+        # died" via MCPSubprocessDiedError on the next call_tool
+        # rather than parsing structured stderr.
+        traceback.print_exc(file=sys.stderr)
         return 7
 
     return 0

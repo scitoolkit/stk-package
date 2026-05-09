@@ -112,21 +112,22 @@ class ToolkitDiscovery:
 
 @dataclass
 class ToolkitRuntime:
-    """A successfully spawned toolkit, post-handshake.
+    """A successfully spawned toolkit, post-connect.
 
-    Carries the data needed to talk to the subprocess (proc, port, client)
-    plus the lifecycle state used by the restart machinery. ``discovery``
-    is held so a restart can re-build the spawn argv without re-walking
-    TOOLKITS_DIR or re-reading metadata.
+    As of 0.4.1, ``mcp_client`` (an Orchestral 1.4 ``MCPClient`` in
+    stdio mode) owns the subprocess lifecycle. The orchestrator never
+    holds a ``Popen`` handle directly, never knows the port (there is
+    none — the wire is the subprocess's own stdin/stdout pipe), and
+    never pumps stderr (the host writes to the per-toolkit log file
+    itself via ``SCITOOLKIT_HOST_LOG``).
+
+    ``discovery`` is held so a restart can rebuild the spawn argv
+    without re-walking TOOLKITS_DIR or re-reading metadata.
     """
     name: str
     path: Path
-    proc: subprocess.Popen
-    port: int
     upstream_tool_names: List[str]
-    mcp_client: Any  # orchestral.mcp.MCPClient
-    stderr_thread: Optional[threading.Thread] = None
-    stderr_logfile_handle: Optional[Any] = None
+    mcp_client: Any  # orchestral.mcp.MCPClient (stdio transport)
     # Restart machinery. See RESTART_BUDGET / RESTART_BACKOFF_S.
     state: ToolkitState = ToolkitState.READY
     restart_attempts: int = 0
@@ -349,13 +350,21 @@ def _build_host_command(
     raise RuntimeError(f"unsupported env_type {disc.env_type!r}")
 
 
-def _build_host_env(toolkit_path: Path) -> Dict[str, str]:
-    """Compose the subprocess environment.
+def _build_host_env(toolkit_path: Path, toolkit_name: str) -> Dict[str, str]:
+    """Compose the subprocess environment for the per-toolkit host.
 
     The toolkit's interpreter doesn't have ``scitoolkit`` installed, only
     ``orchestral-ai`` and ``mcp``. We need ``scitoolkit._toolkit_host`` to
     be importable, so we point ``PYTHONPATH`` at the parent package
     location of the running orchestrator.
+
+    We also pass ``SCITOOLKIT_HOST_LOG`` so the host can redirect its
+    stderr into ``~/.scitoolkit/logs/<toolkit>.log``. Pre-0.4.1 the
+    orchestrator captured the host's stderr via ``Popen(stderr=PIPE)``
+    and pumped it to that file; with Orchestral 1.4's MCPClient owning
+    the subprocess lifecycle, the orchestrator can no longer intercept
+    stderr, so the host writes directly. Same destination, simpler
+    plumbing.
     """
     env = os.environ.copy()
     # Find the directory that contains the ``scitoolkit`` package.
@@ -365,87 +374,31 @@ def _build_host_env(toolkit_path: Path) -> Dict[str, str]:
     env["PYTHONPATH"] = (
         pkg_parent + (os.pathsep + existing if existing else "")
     )
-    # Ensure unbuffered stdout so the handshake line reaches us promptly.
     env["PYTHONUNBUFFERED"] = "1"
+    env["SCITOOLKIT_HOST_LOG"] = str(LOGS_DIR / f"{toolkit_name}.log")
     return env
 
 
-def _spawn_host(
-    disc: ToolkitDiscovery,
-    logger: ToolLogger,
-    *,
-    state_config: Optional[Dict[str, Any]] = None,
-) -> subprocess.Popen:
-    """Launch the host subprocess. Returns the Popen handle.
+def _prepare_per_toolkit_log(toolkit_name: str, pid_hint: str = "") -> None:
+    """Pre-create or rotate the per-toolkit log before host startup.
 
-    ``state_config`` is forwarded to the host via ``--state-config``
-    JSON so ``_inject_state_into_tools`` can populate ``@define_tool(
-    state=[...])`` fields before any tool call lands.
+    The host opens this same path (passed via ``SCITOOLKIT_HOST_LOG``)
+    and appends to it. Running this first ensures rotation happens
+    BEFORE the host writes its first line, and that we add a session
+    separator the user can grep for in long log files.
     """
-    cmd = _build_host_command(disc, state_config=state_config)
-    env = _build_host_env(disc.path)
-    # stdin is a pipe so we can later send a graceful shutdown JSON line
-    # and so closing the pipe also terminates the host.
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        text=True,
-        bufsize=1,  # line-buffered
-    )
-    logger.log_event(
-        "subprocess_spawned",
-        toolkit=disc.name,
-        message=f"interpreter={disc.env_type}",
-        pid=proc.pid,
-    )
-    return proc
-
-
-def _read_handshake(
-    proc: subprocess.Popen,
-    timeout_s: float,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Wait for the host's first stdout line and parse it.
-
-    Returns:
-        (handshake_dict, error_message). Exactly one is non-None.
-    """
-    deadline = time.monotonic() + timeout_s
-    line_holder: List[str] = []
-    err_holder: List[str] = []
-
-    def reader():
-        try:
-            line = proc.stdout.readline() if proc.stdout else ""
-            line_holder.append(line)
-        except Exception as e:  # pragma: no cover
-            err_holder.append(str(e))
-
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
-    t.join(timeout=max(0.0, deadline - time.monotonic()))
-
-    if t.is_alive():
-        return None, f"no handshake within {timeout_s:.0f}s"
-    if err_holder:
-        return None, f"stdout read error: {err_holder[0]}"
-    if not line_holder or not line_holder[0].strip():
-        # Subprocess exited before writing anything.
-        rc = proc.poll()
-        return None, f"host exited before handshake (returncode={rc})"
-
+    log_path = LOGS_DIR / f"{toolkit_name}.log"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _prune_per_toolkit_log_if_oversized(log_path)
     try:
-        payload = json.loads(line_holder[0])
-    except json.JSONDecodeError as e:
-        return None, f"invalid handshake JSON: {e}: {line_holder[0]!r}"
-    if "error" in payload:
-        return None, f"host startup error: {payload['error']}"
-    if "port" not in payload or "tools" not in payload:
-        return None, f"handshake missing keys: {payload!r}"
-    return payload, None
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"\n--- session {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"{' ' + pid_hint if pid_hint else ''} ---\n"
+            )
+    except OSError:
+        # Logging is best-effort; never block startup over it.
+        pass
 
 
 PER_TOOLKIT_LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB
@@ -480,68 +433,11 @@ def _prune_per_toolkit_log_if_oversized(log_path: Path) -> None:
         pass
 
 
-def _wait_for_port_ready(
-    port: int, timeout_s: float = HOST_PORT_READY_TIMEOUT_S,
-) -> bool:
-    """Block until 127.0.0.1:port accepts TCP connections, or timeout.
-
-    The host emits its handshake before ``mcp.run()`` actually binds the
-    listen socket — there's a small window where the port number is known
-    but not yet listening. Without this poll, ``MCPClient.connect()`` can
-    lose the race and fail with ``httpx.ConnectError``. The race is
-    invisible at first launch (the orchestrator does enough other work
-    between handshake and connect to mask it) but reliable on restart
-    when Python is warm and the loop runs faster.
-
-    Returns True if the port came up, False on timeout. Caller decides
-    whether to proceed (we still try to connect either way; the connect
-    error will be more informative than a timeout from here).
-    """
-    import socket
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            try:
-                s.connect(("127.0.0.1", port))
-                return True
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.05)
-    return False
-
-
-def _start_stderr_pump(
-    proc: subprocess.Popen,
-    toolkit_name: str,
-) -> Tuple[threading.Thread, Any]:
-    """Pipe child stderr to ``~/.scitoolkit/logs/<toolkit>.log``.
-
-    Tail-prunes the file at session start if it has grown past the size
-    cap so a long-lived install doesn't end up with multi-GB log files.
-    """
-    log_path = LOGS_DIR / f"{toolkit_name}.log"
-    _prune_per_toolkit_log_if_oversized(log_path)
-    fh = open(log_path, "a", encoding="utf-8")
-    fh.write(f"\n--- session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={proc.pid} ---\n")
-    fh.flush()
-
-    def pump():
-        try:
-            assert proc.stderr is not None
-            for line in proc.stderr:
-                fh.write(line)
-                fh.flush()
-        except Exception:
-            pass
-        finally:
-            try:
-                fh.close()
-            except Exception:
-                pass
-
-    t = threading.Thread(target=pump, name=f"stderr-{toolkit_name}", daemon=True)
-    t.start()
-    return t, fh
+# NOTE 2026-05-07: ``_wait_for_port_ready`` and ``_start_stderr_pump`` were
+# retired with the HTTP-loopback machinery. The stdio MCP path has no port
+# (the wire is the subprocess's own stdin/stdout pipe), and the host
+# writes directly to its per-toolkit log file via ``SCITOOLKIT_HOST_LOG``
+# rather than relying on the orchestrator to pump its stderr.
 
 
 # ── orchestrator ────────────────────────────────────────────────────────
@@ -662,13 +558,15 @@ class Orchestrator:
 
     @dataclass
     class _SpawnResult:
-        """Internal: artifacts of a successful spawn → connect sequence."""
-        proc: subprocess.Popen
-        stderr_thread: threading.Thread
-        stderr_fh: Any
-        port: int
+        """Internal: artifacts of a successful spawn → connect sequence.
+
+        Pre-0.4.1 this carried a Popen handle, stderr pump thread, and
+        port. With Orchestral 1.4's stdio MCPClient, all of that lives
+        inside the client itself — we just hold the client + the tool
+        list it surfaced via MCP's ``tools/list``.
+        """
         upstream_tools: List[str]
-        client: Any  # orchestral.mcp.MCPClient
+        client: Any  # orchestral.mcp.MCPClient (stdio transport)
 
     def _spawn_and_connect(
         self,
@@ -676,74 +574,70 @@ class Orchestrator:
         *,
         state_config: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional["Orchestrator._SpawnResult"], Optional[str]]:
-        """Spawn the host, read handshake, connect MCPClient.
+        """Construct an MCPClient over stdio and connect.
 
-        Returns ``(SpawnResult, None)`` on success or ``(None, error)`` on
-        failure. On failure, any subprocess that did get spawned is killed
-        before returning.
+        The MCPClient owns the host subprocess: ``connect()`` spawns it
+        with the given ``server_command``, runs the MCP handshake,
+        caches the tool list, and holds the session open until
+        ``disconnect()``.
 
-        Used both by initial launch (``_launch_one``) and by restart
-        (``_attempt_restart``). Does not touch ``self._runtimes`` or the
-        proxy-tools list.
+        Returns ``(SpawnResult, None)`` on success or ``(None, error)``
+        on failure. On failure, the (possibly-spawned) subprocess is
+        torn down via ``client.disconnect()``.
 
-        ``state_config`` is forwarded to ``_spawn_host`` so the toolkit
-        host can inject Phase 3C-1 declarative config values onto its
-        tool instances before they're called.
+        ``state_config`` is forwarded to the host via ``--state-config``
+        JSON so ``_inject_state_into_tools`` can populate
+        ``@define_tool(state=[...])`` fields before any tool call lands.
         """
-        try:
-            proc = _spawn_host(disc, self.logger, state_config=state_config)
-        except Exception as e:
-            return None, f"spawn failed: {e}"
+        # Pre-create the per-toolkit log so the host's
+        # SCITOOLKIT_HOST_LOG redirect lands in a real file with a
+        # session-separator header.
+        _prepare_per_toolkit_log(disc.name)
 
-        # Pump stderr to <toolkit>.log immediately (so import failures land there).
-        stderr_thread, stderr_fh = _start_stderr_pump(proc, disc.name)
+        cmd = _build_host_command(disc, state_config=state_config)
+        env = _build_host_env(disc.path, disc.name)
 
-        hs, err = _read_handshake(proc, HOST_HANDSHAKE_TIMEOUT_S)
-        if err:
-            self._kill(proc)
-            return None, err
-
-        port = hs["port"]
-        upstream_tools = hs["tools"]
-
-        # Wait for the port to actually accept connections. The host
-        # emits its handshake before mcp.run() binds the socket; without
-        # this poll, MCPClient.connect() can race the bind and fail with
-        # the opaque "TaskGroup (1 sub-exception)" / httpx.ConnectError
-        # combo. See HOST_PORT_READY_TIMEOUT_S.
-        _wait_for_port_ready(port)
-
-        # Connect MCPClient (HTTP loopback).
-        #
-        # IMPORTANT — DO NOT add a trailing slash to "/mcp".
-        #
-        # FastMCP serves the streamable-http endpoint at "/mcp" (no slash).
-        # If the URL is "/mcp/" instead, FastMCP returns a 307 redirect to
-        # "/mcp", and the streamable-http client (httpx-based) then fails
-        # the request with a HTTPStatusError before the MCP session can
-        # initialize. The failure is opaque — you get a TaskGroup
-        # exception with no obvious indication that a redirect was the
-        # problem. Confirmed by debugging in the May 2026 e2e.
-        #
-        # The matching test is tests/test_orchestrator_url_no_slash.py.
-        # Don't "fix" the slash. If you need to change the path itself
-        # (e.g. FastMCP's default changes), update the test too.
         try:
             from orchestral.mcp import MCPClient
             client = MCPClient(
-                url=f"http://127.0.0.1:{port}/mcp",
+                server_command=cmd,
+                env=env,
                 timeout=self._call_timeout_s,
             )
+        except Exception as e:
+            return None, f"could not construct MCPClient: {e}"
+
+        try:
             client.connect()
         except Exception as e:
-            self._kill(proc)
+            # connect() raises if the host died before MCP init or if
+            # the handshake failed. We try to disconnect anyway in case
+            # the persistent loop did spawn a subprocess that needs
+            # reaping.
+            try:
+                client.disconnect()
+            except Exception:
+                pass
             return None, f"mcp connect failed: {e}"
 
+        # MCPClient caches the tool list during connect via tools/list.
+        try:
+            tool_defs = client.get_tool_definitions()
+            upstream_tools = [d["name"] for d in tool_defs]
+        except Exception as e:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            return None, f"could not list tools after connect: {e}"
+
+        self.logger.log_event(
+            "subprocess_spawned",
+            toolkit=disc.name,
+            message=f"interpreter={disc.env_type}",
+        )
+
         return Orchestrator._SpawnResult(
-            proc=proc,
-            stderr_thread=stderr_thread,
-            stderr_fh=stderr_fh,
-            port=port,
             upstream_tools=upstream_tools,
             client=client,
         ), None
@@ -796,7 +690,7 @@ class Orchestrator:
 
         self.logger.log_event(
             "mcp_client_connected", toolkit=disc.name,
-            port=spawn.port, tool_count=len(spawn.upstream_tools),
+            tool_count=len(spawn.upstream_tools),
         )
 
         # Build proxies from the canonical MCP listing (richer schema info
@@ -846,12 +740,8 @@ class Orchestrator:
         self._runtimes[disc.name] = ToolkitRuntime(
             name=disc.name,
             path=disc.path,
-            proc=spawn.proc,
-            port=spawn.port,
             upstream_tool_names=exposed_tools,
             mcp_client=spawn.client,
-            stderr_thread=spawn.stderr_thread,
-            stderr_logfile_handle=spawn.stderr_fh,
             state=ToolkitState.READY,
             discovery=disc,
         )
@@ -869,28 +759,37 @@ class Orchestrator:
         """Decide whether an exception from ``client.call_tool`` indicates
         the subprocess died (vs. the tool itself raising).
 
-        Crash signals: connection-class errors from httpx or stdlib. Tool
-        exceptions (RuntimeError, ValueError, etc. raised inside the
-        tool body) are *not* crashes — Orchestral catches those upstream
-        and turns them into ``isError=True`` MCP results that come back
-        through the wire normally; we only see them when something more
+        Crash signals: connection-class errors and Orchestral's
+        ``MCPSubprocessDiedError`` (the canonical signal under stdio
+        transport — the persistent-session loop sets ``_subprocess_died``
+        and the next call_tool raises this exception). Tool exceptions
+        (RuntimeError, ValueError, etc. raised inside the tool body)
+        are *not* crashes — Orchestral catches those upstream and turns
+        them into ``isError=True`` MCP results that come back through
+        the wire normally; we only see them when something more
         fundamental is wrong.
 
-        ``proc.poll() is not None`` is the load-bearing check (handled
-        by the caller via ``_classify_call_failure``); this function is
-        the exception-shape heuristic that runs first.
+        Pre-0.4.1 the load-bearing check was ``proc.poll() is not
+        None``; with MCPClient owning the subprocess that lever isn't
+        ours to pull, but ``MCPSubprocessDiedError`` covers the same
+        class of failure with strictly less ambiguity.
         """
+        # MCPSubprocessDiedError is the explicit "host process died"
+        # signal under Orchestral 1.4 stdio. Match by class name so
+        # this module doesn't have to import orchestral.mcp eagerly
+        # (it's a heavy import via mcp SDK).
+        cls_name = type(exc).__name__
+        if cls_name == "MCPSubprocessDiedError":
+            return True
         # ConnectionError covers most stdlib-level cases (connection
-        # refused, reset, etc.). httpx errors don't subclass it, so we
-        # match by name to avoid a hard import dependency on httpx (it
-        # comes in transitively via the MCP client).
+        # refused, reset, etc.).
         if isinstance(exc, ConnectionError):
             return True
-        cls_name = type(exc).__name__
         if cls_name in (
-            "ConnectError",         # httpx: TCP connect failed
+            "ConnectError",         # httpx: TCP connect failed (HTTP transport, kept for safety)
             "RemoteProtocolError",  # httpx: server closed connection mid-stream
             "ReadError",            # httpx: socket read failed
+            "BrokenPipeError",      # stdio pipe closed mid-write
         ):
             return True
         # ExceptionGroup / TaskGroup wrapped errors (anyio): unwrap one level.
@@ -904,14 +803,15 @@ class Orchestrator:
     ) -> bool:
         """Return True iff the failure represents a subprocess crash.
 
-        Combines the exception shape with a ``proc.poll()`` check — even
-        if the exception type doesn't look connection-y, a dead subprocess
-        is a crash.
+        Combines the exception-shape heuristic with the MCPClient's
+        ``_subprocess_died`` flag (set by the persistent-session loop
+        when the connection drops). Even an unfamiliar exception type
+        is a crash if the underlying subprocess is gone.
         """
         if self._is_crash_exception(exc):
             return True
         try:
-            return rt.proc.poll() is not None
+            return bool(getattr(rt.mcp_client, "_subprocess_died", False))
         except Exception:
             return False
 
@@ -997,14 +897,10 @@ class Orchestrator:
         except Exception:
             pass
 
-        # Best-effort cleanup of the prior dead subprocess. The proc may
-        # already be reaped, but if it died by exception (not exit) the
-        # zombie sticks around until we wait on it.
-        try:
-            if rt.proc.poll() is None:
-                self._kill(rt.proc, name=rt.name)
-        except Exception:
-            pass
+        # MCPClient.disconnect() above tears down the subprocess via the
+        # MCP SDK's stdio_client context manager, so we don't need a
+        # separate Popen.kill() pass here. Pre-0.4.1 the orchestrator
+        # held the Popen handle directly and had to reap it manually.
 
         # Re-resolve state-config on restart in case the user edited the
         # config file between sessions (the file is canonical; we always
@@ -1057,15 +953,11 @@ class Orchestrator:
                 self._schedule_restart(rt)
             return
 
-        # Success. Swap in the new subprocess and client; keep the same
-        # ToolkitRuntime object so the proxy's forwarder (which looks up
-        # by name) sees the new client on its next call.
+        # Success. Swap in the new client; keep the same ToolkitRuntime
+        # object so the proxy's forwarder (which looks up by name) sees
+        # the new client on its next call.
         assert spawn is not None
-        rt.proc = spawn.proc
-        rt.port = spawn.port
         rt.mcp_client = spawn.client
-        rt.stderr_thread = spawn.stderr_thread
-        rt.stderr_logfile_handle = spawn.stderr_fh
         rt.state = ToolkitState.READY
         rt.restart_attempts = attempt
         rt.last_error = ""
@@ -1076,7 +968,7 @@ class Orchestrator:
         # the bug. The 4th crash transitions to FAILED via _schedule_restart.
         self.logger.log_event(
             "restart_succeeded", toolkit=rt.name,
-            attempt=attempt, port=spawn.port,
+            attempt=attempt,
             tool_count=len(spawn.upstream_tools),
         )
 
@@ -1139,13 +1031,12 @@ class Orchestrator:
                 if self._classify_call_failure(rt, e):
                     # Subprocess died. Transition to CRASHED, schedule
                     # restart, return guidance.
-                    pid = rt.proc.pid
                     rt.state = ToolkitState.CRASHED
                     rt.last_error = detail
                     self.logger.log_event(
                         "subprocess_crashed", toolkit=toolkit_name,
                         message=detail, level="warn",
-                        pid=pid, state_before="ready",
+                        state_before="ready",
                     )
                     self._schedule_restart(rt)
                     next_attempt = min(
@@ -1189,8 +1080,10 @@ class Orchestrator:
         self.logger.log_event("serve_shutting_down")
 
         for name, rt in list(self._runtimes.items()):
-            # Disconnect MCPClient first so it stops trying to talk to a
-            # subprocess we're about to kill.
+            # MCPClient.disconnect() tears down both the persistent
+            # session and the underlying subprocess (via the MCP SDK's
+            # stdio_client context manager); pre-0.4.1 we had to
+            # SIGTERM Popen ourselves.
             try:
                 rt.mcp_client.disconnect()
                 self.logger.log_event(
@@ -1198,14 +1091,15 @@ class Orchestrator:
                 )
             except Exception:
                 pass
-            self._kill(rt.proc, name=name)
 
-    def _kill(self, proc: subprocess.Popen, name: Optional[str] = None) -> None:
+    def _kill_DEPRECATED(self, proc, name: Optional[str] = None) -> None:
         """Graceful → SIGTERM → SIGKILL.
 
-        ``proc.stdin`` close signals the host to shut down (the host will
-        eventually notice EOF on stdin if we add a watcher there; for now
-        we go straight to terminate).
+        Pre-0.4.1 the orchestrator owned the Popen handle directly and
+        had to reap it itself. With ``MCPClient.disconnect()`` handling
+        teardown, this method is unused. Kept temporarily so any leaked
+        external caller (mocked in old tests, etc.) still imports
+        cleanly until Day 4 sweeps the test suite.
         """
         if proc.poll() is not None:
             return
