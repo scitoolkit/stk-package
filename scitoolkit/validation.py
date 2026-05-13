@@ -602,18 +602,17 @@ def validate_toolkit(toolkit_path: Path) -> ValidationResult:
             except Exception:
                 pass
 
-    # Check for MCP server files (required for Orchestral integration)
-    mcp_dir = toolkit_path / "mcp"
-    if not mcp_dir.exists():
-        result.is_valid = False
-        result.errors.append("Missing required directory: mcp/ (needed for MCP server)")
-    else:
-        mcp_files = ['server_stdio.py', '__init__.py']
-        for filename in mcp_files:
-            file_path = mcp_dir / filename
-            if not file_path.exists():
-                result.is_valid = False
-                result.errors.append(f"Missing required MCP file: mcp/{filename}")
+    # MCP transport is managed by the SciToolkit serve orchestrator — the
+    # per-toolkit subprocess imports tools directly via `_toolkit_host`, no
+    # toolkit-side MCP server is required. The `mcp/` files emitted by
+    # `scitoolkit init` are scaffolding kept for forward-compat with a future
+    # bring-your-own-server path; their presence is not validated here.
+    # An ingested toolkit (e.g. via `scitoolkit ingest`) typically has no
+    # `mcp/` directory at all and that is correct.
+    #
+    # Historical: 0.5.1 and earlier hard-errored on missing
+    # `mcp/server_stdio.py` and `mcp/__init__.py`. Dropped in 0.5.2 — the
+    # rule was vestigial template enforcement that broke ingested toolkits.
 
     # Per-tool existence checks. Branches per form (function: vs module:).
     seen_keys: set = set()

@@ -96,7 +96,7 @@ def main() -> int:
     print("stdout:", result.stdout.rstrip())
     print("stderr:", (result.stderr or "").rstrip())
     assert result.exit_code == 0, "stk list failed"
-    assert "Heads up: 0.5.0 changed the install layout" in (
+    assert "Heads up: 0.5.0 adds multi-version installs" in (
         result.stderr or ""
     ), "Heads-up not on stderr"
     assert "stk reset" in (result.stderr or "")

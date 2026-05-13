@@ -215,7 +215,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.1", prog_name="scitoolkit")
+@click.version_option(version="0.5.2", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -285,9 +285,11 @@ def _warn_legacy_layout_if_present() -> None:
         except Exception:
             pass
         click.echo(
-            "Heads up: 0.5.0 changed the install layout. Toolkits installed under\n"
-            f"{legacy_dir} are no longer used. Run `stk reset` to remove\n"
-            "them and reinstall the ones you need.",
+            "Heads up: 0.5.0 adds multi-version installs and per-project pinning,\n"
+            f"and moved the install dir from {legacy_dir} to ~/.scitoolkit/cache/.\n"
+            f"The old layout at {legacy_dir} is no longer used.\n"
+            "Run `stk reset` to remove it, then `stk install <name>` to repopulate the\n"
+            "new layout. See `stk reset --help` for options.",
             err=True,
         )
     except Exception:

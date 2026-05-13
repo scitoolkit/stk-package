@@ -110,7 +110,7 @@ class TestLegacyDetection:
         # Run a benign command that doesn't itself touch the legacy dir.
         result = runner.invoke(cli.main, ["list"])
         # Heads-up on stderr.
-        assert "Heads up: 0.5.0 changed the install layout" in result.stderr
+        assert "Heads up: 0.5.0 adds multi-version installs" in result.stderr
         # ``list`` itself prints to stdout, not stderr.
         assert "Heads up" not in result.stdout
 

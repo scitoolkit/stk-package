@@ -244,6 +244,82 @@ class TestValidateToolkitExplicit:
         assert not result.is_valid
         assert any("Duplicate" in e for e in result.errors)
 
+    def test_ingested_layout_no_mcp_dir_passes(self, tmp_path):
+        """Ingested toolkits (no ``mcp/`` directory at all) pass validate.
+
+        0.5.1 and earlier hard-errored on missing ``mcp/server_stdio.py`` and
+        ``mcp/__init__.py`` even though the serve orchestrator manages MCP
+        transport itself. 0.5.2 drops that rule entirely. An explicit-form
+        toolkit with no ``mcp/`` dir is a valid ingested layout (e.g.
+        HEPTAPOD).
+        """
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (tmp_path / "pkg" / "mod.py").write_text(
+            "from orchestral import define_tool\n"
+            "@define_tool\n"
+            "def my_tool():\n"
+            "    \"\"\"Doc.\"\"\"\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        yaml_text = (
+            "name: ingested-tk\n"
+            "version: 0.1.0\n"
+            "description: Ingested-style toolkit with no mcp/ dir.\n"
+            "author: A\n"
+            "category: other\n"
+            "tools:\n"
+            "  - name: my_tool\n"
+            "    module: pkg.mod\n"
+        )
+        _scaffold_toolkit(
+            tmp_path, yaml_text,
+            with_tools_dir=False,
+            with_mcp=False,  # explicitly: NO mcp/ dir at all
+        )
+        # Sanity: the mcp dir really does not exist.
+        assert not (tmp_path / "mcp").exists()
+        result = validate_toolkit(tmp_path)
+        assert result.is_valid, f"errors: {result.errors}"
+        # And no error mentions mcp/.
+        assert not any("mcp/" in e for e in result.errors)
+        assert not any("MCP file" in e for e in result.errors)
+
+    def test_scaffolded_layout_with_mcp_dir_still_passes(self, tmp_path):
+        """Regression: toolkits scaffolded by ``scitoolkit init`` (with the
+        ``mcp/`` directory present) must keep validating cleanly. The 0.5.2
+        rule drop is purely additive — the presence of the scaffolded
+        files is neither required nor objected to.
+        """
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (tmp_path / "pkg" / "mod.py").write_text(
+            "from orchestral import define_tool\n"
+            "@define_tool\n"
+            "def my_tool():\n"
+            "    \"\"\"Doc.\"\"\"\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        yaml_text = (
+            "name: scaffolded-tk\n"
+            "version: 0.1.0\n"
+            "description: Toolkit that still has mcp/ scaffolding.\n"
+            "author: A\n"
+            "category: other\n"
+            "tools:\n"
+            "  - name: my_tool\n"
+            "    module: pkg.mod\n"
+        )
+        _scaffold_toolkit(
+            tmp_path, yaml_text,
+            with_tools_dir=False,
+            with_mcp=True,  # init-style: mcp/ files present
+        )
+        result = validate_toolkit(tmp_path)
+        assert result.is_valid, f"errors: {result.errors}"
+
     def test_invalid_module_path_rejected(self, tmp_path):
         yaml_text = (
             "name: bad-mod-tk\n"
