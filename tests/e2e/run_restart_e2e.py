@@ -113,8 +113,12 @@ def main() -> int:
         if rt is None:
             print(f"!!! toolkit {TOOLKIT_NAME!r} did not load")
             return 1
-        print(f"  initial state: {rt.state.name} (pid={rt.proc.pid})")
-        original_pid = rt.proc.pid
+        # 0.4.1+ no longer holds a Popen handle directly — the MCPClient
+        # owns the subprocess. We use ``id(rt.mcp_client)`` as a proxy for
+        # "did the subprocess get rebuilt?" — restart swaps in a brand-new
+        # MCPClient instance (see orchestrator.py ~line 1089).
+        print(f"  initial state: {rt.state.name} (client_id={id(rt.mcp_client)})")
+        original_client_id = id(rt.mcp_client)
 
         # Find the forwarder via the proxy tools list. We invoke the proxy
         # directly (not through the upstream MCP server) so we don't have
@@ -147,9 +151,10 @@ def main() -> int:
                   f"(state={rt.state.name})")
             overall_rc = 3
         else:
-            print(f"  recovered: state={rt.state.name} new pid={rt.proc.pid}")
-            if rt.proc.pid == original_pid:
-                print("!!! pid unchanged — was the subprocess actually restarted?")
+            print(f"  recovered: state={rt.state.name} "
+                  f"new client_id={id(rt.mcp_client)}")
+            if id(rt.mcp_client) == original_client_id:
+                print("!!! mcp_client unchanged — was the subprocess actually restarted?")
                 overall_rc = 4
 
         # Confirm fresh subprocess responds correctly.

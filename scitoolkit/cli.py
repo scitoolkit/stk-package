@@ -215,7 +215,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.4.1", prog_name="scitoolkit")
+@click.version_option(version="0.5.0", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
