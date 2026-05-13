@@ -215,7 +215,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.2", prog_name="scitoolkit")
+@click.version_option(version="0.5.3", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -856,6 +856,33 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
 
     if result.wrote:
         console.print(f"\n[bold green]✓[/bold green] Wrote {result.target}.")
+
+    # Loud-warn about files dropped because their dotted module path
+    # couldn't be resolved. Silent-drop here used to mean the author
+    # shipped a confidently-wrong toolkit.yaml; see issue #1. Goes to
+    # stderr so machine-readable consumers can pipe through.
+    if result.dropped:
+        err_console = Console(stderr=True)
+        n = len(result.dropped)
+        err_console.print(
+            f"\n[bold yellow]WARNING:[/bold yellow] {n} file(s) contained "
+            "tool definitions but were skipped because their module "
+            "path could not be resolved:"
+        )
+        for d in result.dropped:
+            try:
+                rel = d.source_path.relative_to(root)
+                rel_str = str(rel)
+            except ValueError:
+                rel_str = str(d.source_path)
+            err_console.print(
+                f"  [yellow]{rel_str}[/yellow]  ([dim]{d.reason}[/dim])"
+            )
+        err_console.print(
+            "[dim]Add the missing __init__.py file(s) and re-run "
+            "scitoolkit ingest to include these tools.[/dim]"
+        )
+
     if not result.requirements_present:
         console.print(
             "[yellow]WARNING:[/yellow] requirements.txt not found. "
@@ -872,6 +899,24 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
             "Python dependencies."
         )
     console.print("  - Run [cyan]scitoolkit validate[/cyan].")
+    # New-toolkit names must be registered on the registry before
+    # publish will work (404 otherwise). Mention both the CLI flow
+    # and the web UI; ingest's audience is onboarding existing
+    # codebases, so the registration step is just as relevant as for
+    # `scitoolkit init`. See issue #4.
+    console.print(
+        "  - Register the toolkit (skip if already registered). Either:"
+    )
+    console.print(
+        "      [cyan]scitoolkit create <name> --category <cat> "
+        "--description \"...\"[/cyan]"
+    )
+    console.print(
+        "    or create it via the web UI at "
+        "[cyan]https://scitoolkit.org[/cyan]."
+    )
+    console.print("  - Run [cyan]scitoolkit login[/cyan].")
+    console.print("  - Run [cyan]scitoolkit publish[/cyan].")
 
 
 @main.command()

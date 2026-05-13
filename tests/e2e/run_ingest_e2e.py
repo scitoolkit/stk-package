@@ -55,6 +55,57 @@ def main() -> int:
 
     print(f"=== ingest e2e ===\nFixture: {FIXTURE}")
 
+    # Sub-test 1: dropped-file warning. Run before the main happy path
+    # so we can use a clean tmpdir and not pollute the real fixture
+    # walk. Reproduces issue #1: HEPTAPOD-shape repo where an
+    # intermediate __init__.py is missing — we expect ingest to warn
+    # about the file rather than silently dropping it.
+    print("\n--- sub-test: dropped-file warning ---")
+    with tempfile.TemporaryDirectory(prefix="ingest-e2e-drop-") as tmp:
+        drop_repo = Path(tmp) / "drop-repo"
+        pkg = drop_repo / "heptapod_synth"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        analysis = pkg / "analysis"
+        analysis.mkdir()
+        # No __init__.py on purpose — this is the HEPTAPOD shape.
+        (analysis / "conversions.py").write_text(
+            "from orchestral.tools import BaseTool\n"
+            "class Conversions(BaseTool):\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        scitoolkit_bin = shutil.which("scitoolkit")
+        if scitoolkit_bin is None:
+            return _fail(
+                "could not find `scitoolkit` on PATH. "
+                "Activate the dev venv first."
+            )
+        result = subprocess.run(
+            [scitoolkit_bin, "ingest", str(drop_repo), "--no-input"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"--- ingest stdout ---\n{result.stdout}")
+            print(f"--- ingest stderr ---\n{result.stderr}")
+            return _fail(
+                f"`scitoolkit ingest` (drop-test) exited {result.returncode}"
+            )
+        # Warning must go to stderr and name the offending file.
+        if "WARNING" not in result.stderr:
+            print(f"--- ingest stderr ---\n{result.stderr}")
+            return _fail("expected WARNING on stderr for dropped file")
+        if "conversions.py" not in result.stderr:
+            return _fail(
+                "expected dropped file name 'conversions.py' on stderr"
+            )
+        if "__init__.py" not in result.stderr:
+            return _fail(
+                "expected the missing __init__.py hint on stderr"
+            )
+        _ok("dropped-file warning emitted on stderr with offending path")
+
     with tempfile.TemporaryDirectory(prefix="ingest-e2e-") as tmp:
         repo = Path(tmp) / "synth-repo"
         shutil.copytree(FIXTURE, repo)

@@ -82,6 +82,22 @@ class ToolDescriptor:
     kind: Literal["function", "class"]
 
 
+@dataclass(frozen=True)
+class DroppedFile:
+    """A .py file that contained tool-shaped definitions but was skipped.
+
+    Emitted when ``_module_path_for_file`` returns ``None`` for a file
+    that an AST pre-scan flagged as containing ``@define_tool`` or a
+    ``BaseTool`` subclass. The CLI surfaces these as a warning so the
+    author can fix the underlying problem (usually a missing
+    ``__init__.py``) rather than silently shipping an incomplete
+    toolkit.yaml.
+    """
+
+    source_path: Path
+    reason: str
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Walker
 # ─────────────────────────────────────────────────────────────────────
@@ -242,15 +258,32 @@ def _module_path_for_file(path: Path, root: Path) -> Optional[str]:
     - Top-level scripts at the root with no ``__init__.py`` use the
       bare stem.
     """
+    module_path, _reason = _module_path_for_file_with_reason(path, root)
+    return module_path
+
+
+def _module_path_for_file_with_reason(
+    path: Path, root: Path
+) -> Tuple[Optional[str], Optional[str]]:
+    """Like :func:`_module_path_for_file` but also returns a reason for ``None``.
+
+    When the dotted module path can't be resolved, the second element
+    is a short human-readable string suitable for inclusion in a CLI
+    warning (e.g. ``"missing __init__.py in tools/analysis"``).
+
+    On success the reason is ``None``.
+    """
     try:
         rel = path.resolve().relative_to(root.resolve())
     except ValueError:
-        return None
+        return None, "file is outside the ingest root"
 
     parts: List[str] = []
     # Build the package prefix by walking parents up to (but not
     # including) root, collecting each directory iff it has an
-    # __init__.py.
+    # __init__.py. If we hit a directory without one, capture which
+    # directory was missing the marker so the caller can point the
+    # user at exactly the right fix.
     cur = path.parent.resolve()
     root_resolved = root.resolve()
     while cur != root_resolved:
@@ -258,17 +291,60 @@ def _module_path_for_file(path: Path, root: Path) -> Optional[str]:
             parts.append(cur.name)
             cur = cur.parent
         else:
-            # Hit a non-package directory; bail. The file isn't reachable
-            # via a normal dotted import unless the toolkit root is on
-            # sys.path. Caller can still emit it; serve will surface the
-            # error if it doesn't resolve.
-            return None
+            try:
+                missing_rel = cur.relative_to(root_resolved)
+                missing_str = str(missing_rel).replace("\\", "/")
+            except ValueError:
+                missing_str = cur.name
+            reason = (
+                f"missing __init__.py in {missing_str}"
+                if missing_str and missing_str != "."
+                else "missing __init__.py in toolkit root"
+            )
+            return None, reason
     parts.reverse()
 
     if path.name == "__init__.py":
-        return ".".join(parts) if parts else ""
+        return (".".join(parts) if parts else ""), None
     parts.append(path.stem)
-    return ".".join(parts)
+    return ".".join(parts), None
+
+
+def _file_contains_tool_patterns(path: Path) -> bool:
+    """Cheap AST pre-scan: does ``path`` define any tool-shaped symbol?
+
+    Used to decide whether silently skipping a file (because its module
+    path can't be resolved) is "this is a plain Python file, no warning
+    needed" or "this file would have contributed tools — warn the user."
+
+    Mirrors the detection logic in :func:`extract_tools_from_file` but
+    doesn't need the module path: it only checks shape (a top-level
+    ``@define_tool`` decorated function or a top-level ``BaseTool``
+    subclass).
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
+        return False
+
+    define_tool_aliases, basetool_aliases = _resolve_decorator_aliases(tree)
+
+    for node in tree.body:
+        if _is_in_type_checking_block(node, tree):
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for deco in node.decorator_list:
+                if _decorator_is_define_tool(deco, define_tool_aliases):
+                    return True
+        elif isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if _base_is_basetool(base, basetool_aliases):
+                    return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -457,12 +533,37 @@ def discover_tools(root: Path) -> List[ToolDescriptor]:
 
     Sorted by (module, name) for deterministic output.
     """
+    tools, _dropped = discover_tools_and_drops(root)
+    return tools
+
+
+def discover_tools_and_drops(
+    root: Path,
+) -> Tuple[List[ToolDescriptor], List[DroppedFile]]:
+    """Walk ``root`` and return tool descriptors plus dropped files.
+
+    A "dropped" file is one that an AST pre-scan flagged as containing
+    tool-shaped definitions but whose dotted module path could not be
+    resolved (typically because an intermediate directory is missing
+    ``__init__.py``). Reporting these to the user prevents the
+    silent-drop bug where ingest emits fewer tools than the codebase
+    actually defines.
+
+    Both lists are sorted for deterministic output.
+    """
     root = root.resolve()
     found: List[ToolDescriptor] = []
+    dropped: List[DroppedFile] = []
     for py in walk_python_files(root):
+        module_path, reason = _module_path_for_file_with_reason(py, root)
+        if module_path is None or module_path == "":
+            if reason is not None and _file_contains_tool_patterns(py):
+                dropped.append(DroppedFile(source_path=py, reason=reason))
+            continue
         found.extend(extract_tools_from_file(py, root))
     found.sort(key=lambda t: (t.module, t.name))
-    return found
+    dropped.sort(key=lambda d: str(d.source_path))
+    return found, dropped
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -563,6 +664,10 @@ class IngestResult:
 
     ``wrote`` is False for dry-run or when the user declined overwrite.
     ``requirements_present`` carries forward to the CLI summary.
+    ``dropped`` lists files that the walker flagged as containing
+    tool-shaped definitions but whose module path could not be
+    resolved (e.g. missing ``__init__.py``); the CLI surfaces these
+    as a stderr warning so the silent-drop case becomes visible.
     """
 
     tools: List[ToolDescriptor]
@@ -570,6 +675,7 @@ class IngestResult:
     wrote: bool
     requirements_present: bool
     overwrite_blocked: bool = False
+    dropped: List[DroppedFile] = field(default_factory=list)
 
 
 def ingest(
@@ -591,7 +697,7 @@ def ingest(
     """
     root = root.resolve()
     target = (output or (root / "toolkit.yaml")).resolve()
-    tools = discover_tools(root)
+    tools, dropped = discover_tools_and_drops(root)
     requirements_present = (root / "requirements.txt").is_file()
 
     if dry_run:
@@ -600,6 +706,7 @@ def ingest(
             target=target,
             wrote=False,
             requirements_present=requirements_present,
+            dropped=dropped,
         )
 
     existing = load_existing_yaml(target)
@@ -610,6 +717,7 @@ def ingest(
             wrote=False,
             requirements_present=requirements_present,
             overwrite_blocked=True,
+            dropped=dropped,
         )
 
     emit_toolkit_yaml(tools, target, existing=existing)
@@ -618,4 +726,5 @@ def ingest(
         target=target,
         wrote=True,
         requirements_present=requirements_present,
+        dropped=dropped,
     )

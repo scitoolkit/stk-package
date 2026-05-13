@@ -455,3 +455,103 @@ class TestDiscoveryDriver:
         names = {t.name for t in tools}
         assert "real_tool" in names
         assert "fake_tool" not in names
+
+
+class TestDiscoverToolsAndDrops:
+    """Issue #1 regression: files whose dotted module path can't be
+    resolved must surface as :class:`DroppedFile` entries when they
+    contain tool-shaped definitions, not silently disappear.
+    """
+
+    def test_collects_drop_with_reason_for_missing_init(self, tmp_path):
+        from scitoolkit.ingest import discover_tools_and_drops
+
+        _emit_init(tmp_path / "pkg")
+        sub = tmp_path / "pkg" / "subdir"
+        sub.mkdir()
+        # Missing __init__.py on purpose.
+        (sub / "mod.py").write_text(
+            "from orchestral.tools import BaseTool\n"
+            "class T(BaseTool): pass\n",
+            encoding="utf-8",
+        )
+        tools, dropped = discover_tools_and_drops(tmp_path)
+        assert tools == []
+        assert len(dropped) == 1
+        d = dropped[0]
+        assert d.source_path.name == "mod.py"
+        assert "missing __init__.py" in d.reason
+        assert "pkg/subdir" in d.reason or "pkg\\subdir" in d.reason
+
+    def test_no_drop_for_plain_file_without_tools(self, tmp_path):
+        from scitoolkit.ingest import discover_tools_and_drops
+
+        _emit_init(tmp_path / "pkg")
+        sub = tmp_path / "pkg" / "subdir"
+        sub.mkdir()
+        (sub / "plain.py").write_text(
+            "def helper(): return 42\n",
+            encoding="utf-8",
+        )
+        tools, dropped = discover_tools_and_drops(tmp_path)
+        # Plain helper: silent skip is correct.
+        assert tools == []
+        assert dropped == []
+
+    def test_no_drop_when_module_paths_resolve(self, tmp_path):
+        from scitoolkit.ingest import discover_tools_and_drops
+
+        _emit_init(tmp_path / "pkg")
+        _emit_init(tmp_path / "pkg" / "sub")
+        (tmp_path / "pkg" / "sub" / "mod.py").write_text(
+            "from orchestral.tools import BaseTool\n"
+            "class T(BaseTool): pass\n",
+            encoding="utf-8",
+        )
+        tools, dropped = discover_tools_and_drops(tmp_path)
+        assert dropped == []
+        assert len(tools) == 1
+        assert tools[0].module == "pkg.sub.mod"
+
+    def test_drops_sorted_deterministically(self, tmp_path):
+        from scitoolkit.ingest import discover_tools_and_drops
+
+        _emit_init(tmp_path / "pkg")
+        sub = tmp_path / "pkg" / "subdir"
+        sub.mkdir()
+        for name in ("zzz.py", "aaa.py", "mmm.py"):
+            (sub / name).write_text(
+                "from orchestral.tools import BaseTool\n"
+                "class T(BaseTool): pass\n",
+                encoding="utf-8",
+            )
+        _tools, dropped = discover_tools_and_drops(tmp_path)
+        names = [d.source_path.name for d in dropped]
+        assert names == sorted(names)
+
+
+class TestModulePathReason:
+    """Direct tests for ``_module_path_for_file_with_reason``."""
+
+    def test_returns_none_with_reason_for_missing_init(self, tmp_path):
+        from scitoolkit.ingest import _module_path_for_file_with_reason
+
+        _emit_init(tmp_path / "pkg")
+        sub = tmp_path / "pkg" / "subdir"
+        sub.mkdir()
+        f = sub / "mod.py"
+        f.write_text("", encoding="utf-8")
+        module, reason = _module_path_for_file_with_reason(f, tmp_path)
+        assert module is None
+        assert reason is not None
+        assert "missing __init__.py" in reason
+
+    def test_returns_path_no_reason_when_resolvable(self, tmp_path):
+        from scitoolkit.ingest import _module_path_for_file_with_reason
+
+        _emit_init(tmp_path / "pkg")
+        f = tmp_path / "pkg" / "mod.py"
+        f.write_text("", encoding="utf-8")
+        module, reason = _module_path_for_file_with_reason(f, tmp_path)
+        assert module == "pkg.mod"
+        assert reason is None

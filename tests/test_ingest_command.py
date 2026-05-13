@@ -169,3 +169,126 @@ class TestSummaryOutput:
         assert "BaseTool subclasses" in result.output
         assert "my_tool" in result.output
         assert "MyClassTool" in result.output
+
+
+class TestNextStepsBanner:
+    """Regression test for issue #4: the Next-steps banner must walk
+    the author through registration before publish, so they don't hit a
+    confusing 404 from the registry on first publish.
+    """
+
+    def test_mentions_create_and_web_ui_registration(self, tmp_path):
+        _make_repo_with_one_tool(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["ingest", str(tmp_path), "--no-input"]
+        )
+        assert result.exit_code == 0, result.output
+        # The CLI flow.
+        assert "scitoolkit create" in result.output
+        # The web flow.
+        assert "scitoolkit.org" in result.output
+        # The publish flow comes after registration in the listing.
+        assert "scitoolkit login" in result.output
+        assert "scitoolkit publish" in result.output
+
+    def test_register_line_appears_after_validate(self, tmp_path):
+        _make_repo_with_one_tool(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["ingest", str(tmp_path), "--no-input"]
+        )
+        assert result.exit_code == 0
+        # In the Next-steps banner specifically, validate must come
+        # before register, which must come before publish. Anchor on
+        # the "Next steps:" header to skip earlier mentions in the
+        # requirements warning.
+        out = result.output
+        nxt = out.find("Next steps:")
+        assert nxt >= 0, out
+        tail = out[nxt:]
+        i_validate = tail.find("scitoolkit validate")
+        i_register = tail.find("Register the toolkit")
+        i_publish = tail.find("scitoolkit publish")
+        assert i_validate >= 0
+        assert i_register > i_validate
+        assert i_publish > i_register
+
+
+class TestDroppedFileWarning:
+    """Regression test for issue #1: a .py file with tool-shaped
+    definitions whose dotted module path can't be resolved (typically
+    because of a missing intermediate __init__.py) must be reported as
+    a stderr warning, not silently dropped.
+    """
+
+    def _make_repo_with_missing_init(self, root):
+        # pkg/__init__.py exists; pkg/subdir/__init__.py is MISSING.
+        pkg = root / "pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        sub = pkg / "subdir"
+        sub.mkdir()
+        # No __init__.py here on purpose.
+        (sub / "mod.py").write_text(
+            "from orchestral.tools import BaseTool\n"
+            "class DroppedTool(BaseTool):\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+    def test_warns_when_file_has_tool_pattern_but_no_module_path(
+        self, tmp_path
+    ):
+        self._make_repo_with_missing_init(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["ingest", str(tmp_path), "--no-input"]
+        )
+        assert result.exit_code == 0, result.output
+        # The warning text and filename must appear; the missing-init
+        # hint should call out the right directory.
+        assert "WARNING" in result.output
+        assert "mod.py" in result.output
+        assert "pkg/subdir" in result.output or "pkg\\subdir" in result.output
+
+    def test_no_warning_for_plain_files_without_tool_patterns(self, tmp_path):
+        # Same shape but the file under the missing-init dir has no
+        # tools — silent skip is correct here.
+        pkg = tmp_path / "pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "tool.py").write_text(
+            "from orchestral import define_tool\n"
+            "@define_tool\n"
+            "def my_tool():\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        sub = pkg / "subdir"
+        sub.mkdir()
+        # No __init__.py, no tools either — should not warn.
+        (sub / "plain.py").write_text(
+            "def just_a_helper():\n"
+            "    return 42\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["ingest", str(tmp_path), "--no-input"]
+        )
+        assert result.exit_code == 0, result.output
+        # No dropped-file warning. (The requirements.txt warning is
+        # unrelated — match on the dropped-file phrasing specifically.)
+        assert "could not be resolved" not in result.output
+        # And the legitimate tool was still discovered.
+        assert "my_tool" in result.output
+
+    def test_no_warning_for_well_formed_repo(self, tmp_path):
+        _make_repo_with_one_tool(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["ingest", str(tmp_path), "--no-input"]
+        )
+        assert result.exit_code == 0
+        assert "could not be resolved" not in result.output
