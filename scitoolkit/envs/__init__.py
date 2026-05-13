@@ -76,6 +76,24 @@ from .config import (
     load_user_config_layer,
     load_project_config_layer,
 )
+from .cache import (
+    CacheEntry,
+    INSTALL_META_FILE,
+    LAST_USED_FILE,
+    DISK_SIZE_FILE,
+    LEGACY_META_FILE,
+    write_install_meta,
+    read_install_meta,
+    write_legacy_meta,
+    read_legacy_meta,
+    touch_last_used,
+    read_last_used,
+    compute_and_write_disk_size,
+    read_disk_size,
+    walk_cache,
+    list_versions,
+    find_slot,
+)
 
 
 __all__ = [
@@ -109,4 +127,21 @@ __all__ = [
     "resolve_toolkit_config",
     "load_user_config_layer",
     "load_project_config_layer",
+    # cache slot metadata
+    "CacheEntry",
+    "INSTALL_META_FILE",
+    "LAST_USED_FILE",
+    "DISK_SIZE_FILE",
+    "LEGACY_META_FILE",
+    "write_install_meta",
+    "read_install_meta",
+    "write_legacy_meta",
+    "read_legacy_meta",
+    "touch_last_used",
+    "read_last_used",
+    "compute_and_write_disk_size",
+    "read_disk_size",
+    "walk_cache",
+    "list_versions",
+    "find_slot",
 ]
