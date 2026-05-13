@@ -3258,29 +3258,86 @@ def install(name, version, no_skills, yes, no_, no_input):
 
 
 @main.command(name='list')
-def list_cmd():
+@click.option(
+    "--json", "as_json", is_flag=True, default=False,
+    help=(
+        "Emit a flat JSON array of {name, version, last_used_iso, "
+        "size_bytes, pinned_in_project} for agent / scripting consumption. "
+        "Suppresses the tree output and the legacy-layout heads-up."
+    ),
+)
+def list_cmd(as_json):
     """
     List all installed toolkits.
 
-    Walks ``~/.scitoolkit/cache/<name>/<version>/`` and groups by name.
-    Multi-version installs are shown side-by-side. Per entry:
+    Walks ``~/.scitoolkit/cache/<name>/<version>/`` and renders one
+    entry per (name, version) slot, grouped by name:
 
     \b
-    - last_used: human-friendly delta from the per-slot ``.last_used``
-      file (touched on every ``stk serve`` spawn).
-    - disk_size: bytes from the per-slot ``.disk_size`` file (computed
-      once at install time). "—" if missing.
+        $ stk list
+        heptapod
+          - 0.1     (used 3 days ago, 8.2 GB)
+          - 0.3 *   (used yesterday, 8.4 GB)
+        arxiv-search
+          - 0.2 *   (used 2 hours ago, 180 MB)
 
-    Example:
+        * = pinned in this project (./.scitoolkit/manifest.yaml)
+
+    \b
+    Per-entry fields:
+      - ``last_used``: human-friendly delta from the per-slot
+        ``.last_used`` file (touched on every ``stk serve`` spawn).
+        ``"never"`` if missing.
+      - ``disk_size``: bytes from the per-slot ``.disk_size`` file
+        (computed once at install time). ``"—"`` if missing.
+      - ``*``: marks the version pinned in the active project's
+        manifest (whichever ``.scitoolkit/manifest.yaml`` discovery
+        resolves to). Legend printed only when at least one pin
+        applies. Default-project pins are flagged the same way; the
+        legend points at the resolved manifest path.
+
+    With ``--json``, output is a flat array of objects:
+
+    \b
+        [
+          {"name": "heptapod", "version": "0.1.0",
+           "last_used_iso": "2026-05-09T14:23:00", "size_bytes": 8200000000,
+           "pinned_in_project": false},
+          ...
+        ]
+
+    Examples:
         scitoolkit list
+        stk list --json
     """
     from .envs import walk_cache
 
     entries = walk_cache()
 
+    # Resolve the active project so we can mark pinned versions. Reads
+    # never fall back to interactive prompts; the helper silently uses
+    # default-project when no .scitoolkit/ is found.
+    pin_map, manifest_path = _list_resolve_pin_map(entries)
+
+    if as_json:
+        payload = [
+            {
+                "name": e.name,
+                "version": e.version,
+                "last_used_iso": e.last_used_iso,
+                "size_bytes": e.disk_size_bytes,
+                "pinned_in_project": pin_map.get(e.name) == e.version,
+            }
+            for e in _list_sorted_entries(entries)
+        ]
+        click.echo(json.dumps(payload, indent=2))
+        return
+
     if not entries:
         console.print("[dim]No toolkits installed.[/dim]")
-        console.print("\nInstall one with: [cyan]scitoolkit install <name>[/cyan]")
+        console.print(
+            "\nTry: [cyan]stk install arxiv-search[/cyan]"
+        )
         return
 
     # Group entries by toolkit name; within a name, sort by version desc.
@@ -3294,55 +3351,102 @@ def list_cmd():
             reverse=True,
         )
 
-    table = Table(title="Installed Toolkits")
-    table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Version", style="white")
-    table.add_column("Environment", style="white")
-    table.add_column("Last used", style="white")
-    table.add_column("Disk size", style="white", justify="right")
-    table.add_column("Tools", justify="right", style="dark_orange")
-    table.add_column("Skills", justify="right", style="dark_orange")
-
+    any_pin_applied = False
     for name in sorted(grouped):
-        first = True
+        console.print(f"[cyan]{name}[/cyan]")
         for entry in grouped[name]:
-            # Prefer install_meta; fall back to legacy_meta when fields
-            # haven't been migrated yet.
-            meta = entry.install_meta or entry.legacy_meta
-            env_type = meta.get('install_method') or meta.get('environment', 'unknown')
-            py_ver = meta.get('python_version', '?')
-            env_label = f"{env_type} (py{py_ver})"
-
-            name_cell = name if first else ""
-            first = False
-
-            tools_count = meta.get('tools_count', 0)
-            skills_count = meta.get('skills_count', 0)
-            if meta.get('has_setup_script'):
-                # Mirror the prior surface: setup-script toolkits get a
-                # subtle indicator until validate(ctx) passes.
-                pass  # serve will skip if validate fails; not flagged here
-
-            table.add_row(
-                name_cell,
-                entry.version,
-                env_label,
-                _format_last_used(entry.last_used_iso),
-                _format_disk_size(entry.disk_size_bytes),
-                str(tools_count),
-                str(skills_count),
+            pinned = pin_map.get(name) == entry.version
+            if pinned:
+                any_pin_applied = True
+            marker = " [yellow]*[/yellow]" if pinned else ""
+            last_used = _format_last_used(entry.last_used_iso)
+            size = _format_disk_size(entry.disk_size_bytes)
+            # Version column padded a little so the parenthetical
+            # aligns across rows that have / don't have the pin marker.
+            ver_cell = f"{entry.version}{marker}"
+            console.print(
+                f"  - {ver_cell}   "
+                f"[dim](used {last_used}, {size})[/dim]"
             )
 
-    console.print(table)
+    if any_pin_applied and manifest_path is not None:
+        # Render the manifest path relative to cwd when possible — keeps
+        # the legend readable in real-project usage. Falls back to the
+        # absolute path for default-project or when relative-resolution
+        # fails (e.g. across drive letters on Windows).
+        try:
+            rel = manifest_path.relative_to(Path.cwd())
+            display = f"./{rel}"
+        except ValueError:
+            display = str(manifest_path)
+        console.print()
+        console.print(
+            f"[dim]* = pinned in this project ({display})[/dim]"
+        )
 
 
-def _format_last_used(iso_stamp: Optional[str]) -> str:
+def _list_sorted_entries(entries):
+    """Return entries deterministically sorted by (name asc, version desc)."""
+    from .versioning import parse_version
+    return sorted(
+        entries,
+        key=lambda e: (
+            e.name,
+            tuple(-x for x in (parse_version(e.version) or (0, 0, 0))),
+        ),
+    )
+
+
+def _list_resolve_pin_map(entries):
+    """Return ``(pin_map, manifest_path)`` for the active project.
+
+    ``pin_map`` is ``{toolkit_name: pinned_version}`` for every entry
+    pinned in the active project's manifest. Returns an empty dict
+    (and ``None`` manifest path) when no entries are pinned or the
+    manifest is unreadable. Read-only; never creates a project dir.
+    """
+    if not entries:
+        return {}, None
+    try:
+        from .envs import (
+            project_manifest_path as _project_manifest_path,
+            load_manifest as _load_manifest,
+        )
+        project_root, _source = _resolve_active_project_root()
+        manifest_path = _project_manifest_path(project_root)
+        if not manifest_path.exists():
+            return {}, None
+        manifest = _load_manifest(manifest_path)
+        return (
+            {e.name: e.version for e in manifest.toolkits},
+            manifest_path,
+        )
+    except Exception:
+        # Manifest read errors (schema-too-new, malformed) shouldn't
+        # break list. Skip the pin indicator and proceed.
+        return {}, None
+
+
+def _format_last_used(
+    iso_stamp: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> str:
     """Render an ISO-8601 timestamp as a human-friendly 'X ago'.
 
-    Returns "never" for missing stamps, "just now" / "X seconds ago" /
-    "X minutes ago" / "X hours ago" / "X days ago" / "X weeks ago"
-    otherwise. Never raises — formatting issues fall back to the raw
-    stamp.
+    Phase-5 forms (spec'd in the Environments brief):
+      - missing stamp → ``"never"``
+      - <5s →            ``"just now"``
+      - <60s →           ``"N seconds ago"`` / ``"1 second ago"``
+      - <60m →           ``"N minutes ago"`` / ``"1 minute ago"``
+      - <24h →           ``"N hours ago"`` / ``"1 hour ago"``
+      - <2d →            ``"yesterday"``
+      - <14d →           ``"N days ago"``
+      - <8w →            ``"N weeks ago"`` / ``"1 week ago"``
+      - >=8w →           ``"N months ago"`` (rough; 30-day months)
+
+    ``now`` is injectable for deterministic tests. Never raises —
+    formatting issues fall back to the raw stamp.
     """
     if not iso_stamp:
         return "never"
@@ -3350,22 +3454,31 @@ def _format_last_used(iso_stamp: Optional[str]) -> str:
         ts = datetime.fromisoformat(iso_stamp)
     except (TypeError, ValueError):
         return iso_stamp
-    delta = datetime.now() - ts
+    reference = now if now is not None else datetime.now()
+    delta = reference - ts
     secs = int(delta.total_seconds())
     if secs < 0:
         return "just now"  # clock skew
     if secs < 5:
         return "just now"
     if secs < 60:
-        return f"{secs}s ago"
+        return f"{secs} seconds ago" if secs != 1 else "1 second ago"
     if secs < 3600:
-        return f"{secs // 60}m ago"
+        m = secs // 60
+        return f"{m} minutes ago" if m != 1 else "1 minute ago"
     if secs < 86400:
-        return f"{secs // 3600}h ago"
+        h = secs // 3600
+        return f"{h} hours ago" if h != 1 else "1 hour ago"
     days = secs // 86400
+    if days < 2:
+        return "yesterday"
     if days < 14:
-        return f"{days}d ago"
-    return f"{days // 7}w ago"
+        return f"{days} days ago"
+    weeks = days // 7
+    if weeks < 8:
+        return f"{weeks} weeks ago" if weeks != 1 else "1 week ago"
+    months = days // 30
+    return f"{months} months ago" if months != 1 else "1 month ago"
 
 
 def _format_disk_size(size_bytes: Optional[int]) -> str:
