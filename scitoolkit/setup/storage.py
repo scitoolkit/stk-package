@@ -1,9 +1,18 @@
 """
 File-canonical YAML storage for toolkit config.
 
-Every toolkit's persistent configuration lives at:
+Two-layer (Phase 4, 0.5.0):
 
-    ~/.scitoolkit/config/<toolkit>.yaml
+- *User layer* (the legacy, default): ``~/.scitoolkit/config/<toolkit>.yaml``.
+  Per-machine identity (API keys, data paths).
+- *Project layer* (new): ``<project>/.scitoolkit/config/<toolkit>.yaml``.
+  Per-project overrides; keys override the user layer key-by-key.
+
+Every read / write function takes an optional ``layer`` argument
+(``"user"`` or ``"project"``). When ``layer="project"``, a
+``project_root`` must be supplied — there is no implicit default.
+Backward compatibility: omitting ``layer`` resolves to ``"user"`` (the
+0.4.x behavior).
 
 This module is the read/write layer. It uses ``ruamel.yaml`` so user
 comments survive ``set`` / ``unset`` round-trips — without that, every
@@ -17,19 +26,21 @@ tmp dir is enough to redirect the entire config-storage surface.
 Don't "simplify" back to a bound default; the naive form silently
 writes tests' config into the developer's real ``~/.scitoolkit/``.
 
-File mode is ``0600`` because the file may contain secrets.
+File mode is ``0600`` because the file may contain secrets. (Project-
+layer files use the same mode for consistency, even though they're
+intended to be checked into git — if a user writes a secret to the
+project layer, the file permissions are still tight.)
 
 The exposed surface:
 
 - ``config_dir()`` — the directory ``~/.scitoolkit/config/``.
-- ``config_path(name)`` — full path for one toolkit's config.
-- ``load_config(name)`` — read into a dict-like (CommentedMap from
-  ruamel; behaves like a dict for our purposes).
-- ``save_config(name, data)`` — write back, preserving comments if a
-  ``CommentedMap`` was loaded and mutated.
-- ``set_config_value(name, key, value)`` — atomic single-field update.
-- ``unset_config_value(name, key)`` — remove one field.
-- ``delete_config(name)`` — remove the whole file (e.g. for ``--reset``).
+- ``config_path(name, *, layer="user", project_root=None)`` — full path
+  for one toolkit's config in the given layer.
+- ``load_config(name, *, layer="user", project_root=None)`` — read.
+- ``save_config(name, data, *, layer="user", project_root=None)`` — write.
+- ``set_config_value(name, key, value, *, layer="user", project_root=None)``.
+- ``unset_config_value(name, key, *, layer="user", project_root=None)``.
+- ``delete_config(name, *, layer="user", project_root=None)`` — remove file.
 """
 
 from __future__ import annotations
@@ -42,6 +53,22 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
 from .. import config as _config_mod
+
+
+# Current schema version stamped on every saved config file (Phase 4,
+# 0.5.0). Read-time refusal of newer files is delegated to
+# ``envs.schema.read_versioned_yaml`` via the same constant.
+_SCHEMA_VERSION = 1
+_USER_FILE_TYPE = "toolkit_config"
+_PROJECT_FILE_TYPE = "project_config"
+
+
+def _file_type_for(layer: str) -> str:
+    if layer == "user":
+        return _USER_FILE_TYPE
+    if layer == "project":
+        return _PROJECT_FILE_TYPE
+    raise ValueError(f"unknown config layer {layer!r} (expected 'user' or 'project')")
 
 
 # ruamel YAML instance, configured for our use case.
@@ -75,23 +102,68 @@ def _resolve_config_dir() -> Path:
 
 
 def config_dir(*, base: Optional[Path] = None) -> Path:
-    """Return the per-toolkit config directory (creates if missing)."""
+    """Return the per-toolkit user-level config directory (creates if missing).
+
+    Always resolves the *user* layer. Use ``project_config_dir`` (or
+    ``config_path(..., layer='project', project_root=...)``) for the
+    project layer.
+    """
     if base is None:
         base = _resolve_config_dir()
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
-def config_path(toolkit_name: str, *, base: Optional[Path] = None) -> Path:
-    """Path to ``<config_dir>/<toolkit>.yaml``. Does not create the file."""
-    return config_dir(base=base) / f"{toolkit_name}.yaml"
+def project_config_dir(project_root: Path) -> Path:
+    """Return ``<project_root>/.scitoolkit/config/`` (creates if missing).
+
+    Handles the default-project special-case via ``envs.paths``.
+    """
+    from ..envs.paths import _is_default_project
+    if _is_default_project(project_root):
+        d = project_root / "config"
+    else:
+        d = project_root / ".scitoolkit" / "config"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def config_path(
+    toolkit_name: str,
+    *,
+    base: Optional[Path] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
+) -> Path:
+    """Path to ``<config_dir>/<toolkit>.yaml`` for the requested layer.
+
+    - ``layer="user"`` (default; backward compatible): the
+      ``~/.scitoolkit/config/<toolkit>.yaml`` path.
+    - ``layer="project"``: the ``<project>/.scitoolkit/config/<toolkit>.yaml``
+      path. Requires ``project_root`` to be supplied.
+
+    Does not create the file.
+    """
+    if layer == "user":
+        return config_dir(base=base) / f"{toolkit_name}.yaml"
+    if layer == "project":
+        if project_root is None:
+            raise ValueError(
+                "config_path(layer='project') requires project_root"
+            )
+        return project_config_dir(project_root) / f"{toolkit_name}.yaml"
+    raise ValueError(f"unknown config layer {layer!r} (expected 'user' or 'project')")
 
 
 # ── read / write ─────────────────────────────────────────────────────
 
 
 def load_config(
-    toolkit_name: str, *, base: Optional[Path] = None,
+    toolkit_name: str,
+    *,
+    base: Optional[Path] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
 ) -> CommentedMap:
     """Read ``<toolkit>.yaml`` into a ruamel ``CommentedMap``.
 
@@ -102,8 +174,13 @@ def load_config(
     Raises ``OSError`` only on actual read failures (permission, etc.).
     Malformed YAML is converted to a clear ``ValueError`` so callers
     don't have to import ruamel exception classes.
+
+    Also refuses files whose ``schema_version`` exceeds what this build
+    understands (``envs.schema.SchemaTooNewError``).
     """
-    path = config_path(toolkit_name, base=base)
+    path = config_path(
+        toolkit_name, base=base, layer=layer, project_root=project_root,
+    )
     if not path.exists():
         return CommentedMap()
     try:
@@ -123,6 +200,14 @@ def load_config(
             f"{path}: expected a YAML mapping at the top level, got "
             f"{type(data).__name__}"
         )
+    # Schema-version sanity check. Missing field → assume legacy v0,
+    # accept silently. Newer than we know → refuse.
+    from ..envs.schema import MAX_SCHEMA_VERSION, SchemaTooNewError
+    file_type = _file_type_for(layer)
+    max_known = MAX_SCHEMA_VERSION[file_type]
+    sv = data.get("schema_version", 0)
+    if isinstance(sv, int) and sv > max_known:
+        raise SchemaTooNewError(path, file_type, sv, max_known)
     return data
 
 
@@ -132,6 +217,8 @@ def save_config(
     *,
     base: Optional[Path] = None,
     header_comment: Optional[str] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
 ) -> Path:
     """Write ``data`` to ``<toolkit>.yaml`` atomically with mode 0600.
 
@@ -146,10 +233,15 @@ def save_config(
     ``run_install_setup`` to seed a freshly-written file with a
     "this file is canonical, edit anytime" pointer.
 
+    The current ``schema_version`` is stamped on every write (Phase 4,
+    0.5.0). If the data lacks the field, it's inserted at the top.
+
     Atomic-write: write to ``<path>.tmp`` then ``os.replace``. Stops
     a Ctrl-C-interrupted write from leaving a partial file.
     """
-    path = config_path(toolkit_name, base=base)
+    path = config_path(
+        toolkit_name, base=base, layer=layer, project_root=project_root,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # If a header comment was requested and the data has no leading
@@ -175,6 +267,24 @@ def save_config(
             # don't crash if a future major changes the signature.
             pass
 
+    # Stamp schema_version: 1 if not already present. We keep it at the
+    # top of the map for readability. ruamel preserves dict order, so
+    # inserting at position 0 puts it first in the rendered file.
+    if not isinstance(data, CommentedMap):
+        converted = CommentedMap()
+        if "schema_version" not in data:
+            converted["schema_version"] = _SCHEMA_VERSION
+        for k, v in data.items():
+            converted[k] = v
+        data = converted
+    elif "schema_version" not in data:
+        # CommentedMap supports insert(index, key, value) to put the
+        # field at the top of the map.
+        try:
+            data.insert(0, "schema_version", _SCHEMA_VERSION)
+        except Exception:
+            data["schema_version"] = _SCHEMA_VERSION
+
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         _yaml.dump(data, f)
@@ -188,10 +298,16 @@ def save_config(
 
 
 def delete_config(
-    toolkit_name: str, *, base: Optional[Path] = None,
+    toolkit_name: str,
+    *,
+    base: Optional[Path] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
 ) -> bool:
     """Delete the toolkit's config file. Returns True if a file was removed."""
-    path = config_path(toolkit_name, base=base)
+    path = config_path(
+        toolkit_name, base=base, layer=layer, project_root=project_root,
+    )
     if not path.exists():
         return False
     try:
@@ -210,15 +326,21 @@ def set_config_value(
     value: Any,
     *,
     base: Optional[Path] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
 ) -> Path:
     """Set one field; preserve every other field and all comments.
 
     Read → mutate → write, all in this function so the caller doesn't
     have to worry about losing state by re-saving stale data.
     """
-    data = load_config(toolkit_name, base=base)
+    data = load_config(
+        toolkit_name, base=base, layer=layer, project_root=project_root,
+    )
     data[key] = value
-    return save_config(toolkit_name, data, base=base)
+    return save_config(
+        toolkit_name, data, base=base, layer=layer, project_root=project_root,
+    )
 
 
 def unset_config_value(
@@ -226,11 +348,17 @@ def unset_config_value(
     key: str,
     *,
     base: Optional[Path] = None,
+    layer: str = "user",
+    project_root: Optional[Path] = None,
 ) -> bool:
     """Remove one field. Returns True if the key existed."""
-    data = load_config(toolkit_name, base=base)
+    data = load_config(
+        toolkit_name, base=base, layer=layer, project_root=project_root,
+    )
     if key not in data:
         return False
     del data[key]
-    save_config(toolkit_name, data, base=base)
+    save_config(
+        toolkit_name, data, base=base, layer=layer, project_root=project_root,
+    )
     return True

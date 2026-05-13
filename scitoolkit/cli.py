@@ -17,7 +17,7 @@ import subprocess
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import yaml
 import tarfile
 import tempfile
@@ -177,7 +177,7 @@ class _SectionedGroup(click.Group):
         ),
         (
             "Configuration",
-            ["config", "setup"],
+            ["config", "setup", "project"],
         ),
     ]
 
@@ -212,6 +212,20 @@ class _SectionedGroup(click.Group):
 
 @click.group(cls=_SectionedGroup)
 @click.version_option(version="0.4.1", prog_name="scitoolkit")
+@click.option(
+    "--project-dir",
+    "project_dir_override",
+    type=click.Path(file_okay=False, resolve_path=False),
+    default=None,
+    hidden=True,
+    expose_value=False,
+    is_eager=True,
+    callback=lambda ctx, param, value: _stash_project_dir_override(ctx, value),
+    help=(
+        "Override project discovery and treat <path> as the active project "
+        "root. Power-user / CI / scripting flag — see `stk` documentation."
+    ),
+)
 def main():
     """
     SciToolkit - Scientific agentic tools made easy
@@ -219,6 +233,137 @@ def main():
     A platform for creating, publishing, and using AI tools for science.
     """
     pass
+
+
+def _stash_project_dir_override(ctx, value):
+    """Top-level ``--project-dir`` callback — stash on ctx.obj for later.
+
+    The flag is hidden / eager so it gets parsed before any subcommand
+    needs to resolve the active project root. Subcommands (or helpers
+    they call) read the override via ``_resolve_active_project_root``.
+    """
+    if ctx.obj is None:
+        ctx.obj = {}
+    if value is not None:
+        ctx.obj["project_dir_override"] = Path(value)
+    return value
+
+
+def _resolve_active_project_root(
+    *,
+    cwd: Optional[Path] = None,
+    allow_implicit_create: bool = False,
+    mode: str = "ask",
+    create_message: Optional[str] = None,
+):
+    """Return the active project root (Path) for the current command.
+
+    Honors (in priority order):
+      1. ``--project-dir`` global override (stashed on the Click context).
+      2. Discovery walk upward from ``cwd`` for a ``.scitoolkit/manifest.yaml``.
+      3. ``allow_implicit_create=True`` + TTY: prompt to create
+         ``.scitoolkit/`` in ``cwd`` (default-Y).
+      4. Fall back to ``~/.scitoolkit/default-project/``.
+
+    Returns a ``(project_root, source)`` tuple where source is one of
+    ``"override" | "walk" | "implicit-create" | "fallback"``. A greppable
+    log line ``[scitoolkit.envs] project_discovered ...`` is emitted on
+    every call for debug visibility.
+
+    ``allow_implicit_create`` is True for ``stk install``; False for
+    every other command that reads the project (uninstall, serve, list,
+    config, setup) — those silently fall back if no project exists,
+    matching the "casual user shouldn't be upgraded into a project just
+    by reading state" lean.
+    """
+    from .envs import (
+        find_project_root as _find_project_root,
+        default_project_root as _default_project_root,
+        project_manifest_path as _project_manifest_path,
+    )
+
+    # 1. Override stashed by the eager top-level callback.
+    ctx = click.get_current_context(silent=True)
+    override: Optional[Path] = None
+    if ctx is not None and ctx.obj and isinstance(ctx.obj, dict):
+        override = ctx.obj.get("project_dir_override")
+
+    if override is not None:
+        # Resolve but don't require existence — the override may be a
+        # path that doesn't have a .scitoolkit/ yet (legit for CI seeding).
+        resolved = override.resolve()
+        _log_project_discovered(resolved, "override")
+        return resolved, "override"
+
+    # 2. Walk upward from cwd.
+    if cwd is None:
+        cwd = Path.cwd()
+    found = _find_project_root(cwd=cwd)
+    if found is not None:
+        _log_project_discovered(found, "walk")
+        return found, "walk"
+
+    # 3. Optional implicit creation (only on ``stk install`` in a TTY).
+    if allow_implicit_create and mode == "ask":
+        msg = create_message or (
+            f"No .scitoolkit/ found above {cwd}. Create one here?"
+        )
+        try:
+            if click.confirm(msg, default=True):
+                target = cwd.resolve()
+                _materialize_project_dir(target)
+                _log_project_discovered(target, "implicit-create")
+                return target, "implicit-create"
+        except click.exceptions.Abort:
+            # User Ctrl-C'd the prompt — fall through to default-project
+            # silently. The command they invoked still proceeds; they
+            # just don't get a new project dir created behind their back.
+            pass
+
+    # 4. Default-project fallback.
+    default = _default_project_root()
+    _log_project_discovered(default, "fallback")
+    return default, "fallback"
+
+
+def _materialize_project_dir(project_root: Path) -> Path:
+    """Create ``<project_root>/.scitoolkit/`` and an empty manifest.yaml.
+
+    Idempotent — if the dir / manifest already exists, leaves them alone.
+    Returns the path to the manifest file.
+    """
+    from .envs import (
+        project_manifest_path as _project_manifest_path,
+        save_manifest as _save_manifest,
+        Manifest as _Manifest,
+    )
+
+    manifest_path = _project_manifest_path(project_root)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not manifest_path.exists():
+        _save_manifest(manifest_path, _Manifest())
+    return manifest_path
+
+
+def _log_project_discovered(path: Path, source: str) -> None:
+    """Emit a greppable ``[scitoolkit.envs]`` log line for debug visibility.
+
+    Uses the existing ToolLogger if available (so the line lands in
+    serve.log when running under ``stk serve``); otherwise falls back
+    to writing nothing — the line is for grep, not for normal output.
+    """
+    try:
+        from .logging.logger import get_logger
+        logger = get_logger()
+        logger.log_event(
+            event="project_discovered",
+            path=str(path),
+            source=source,
+        )
+    except Exception:
+        # Logging is best-effort. Never fail a command because the
+        # debug line couldn't be written.
+        pass
 
 
 @main.command()
@@ -987,6 +1132,80 @@ def _login_browser_flow(mode: str) -> None:
     )
 
 
+# ────────────────────────────────────────────────────────────────────────
+# `scitoolkit project` — manage project-local manifests.
+#
+# A project is any directory with a ``.scitoolkit/manifest.yaml``. Walk-
+# upward discovery makes any subdirectory of a project a project member
+# too. ``stk install`` in a project pins its toolkit version into the
+# project's manifest, so different projects can pin different versions
+# of the same toolkit without conflict.
+#
+# Most users will never run ``stk project init`` explicitly — ``stk
+# install`` in a non-project dir prompts (TTY) "create .scitoolkit/
+# here?" and does it for them. This subcommand is the explicit
+# alternative for scripts / CI that want to seed the dir up-front.
+# ────────────────────────────────────────────────────────────────────────
+
+
+@main.group()
+def project():
+    """Manage project-local SciToolkit manifests."""
+    pass
+
+
+@project.command(name="init")
+@click.option(
+    "--path", "target_path",
+    type=click.Path(file_okay=False, resolve_path=False),
+    default=None,
+    help="Directory to initialize (default: cwd).",
+)
+@_interactive_options
+def project_init(target_path, yes, no_, no_input):
+    """Create ``.scitoolkit/`` + empty ``manifest.yaml`` in this directory.
+
+    Idempotent — if a project already exists at the target, prints
+    where it is and exits cleanly. The created manifest is empty;
+    ``stk install <name>`` will populate it.
+    """
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    target = Path(target_path) if target_path else Path.cwd()
+    target = target.resolve()
+    if not target.exists():
+        console.print(
+            f"[red]✗ Target directory does not exist: {target}[/red]"
+        )
+        sys.exit(1)
+    if not target.is_dir():
+        console.print(f"[red]✗ Not a directory: {target}[/red]")
+        sys.exit(1)
+
+    from .envs import project_manifest_path as _project_manifest_path
+
+    manifest_path = _project_manifest_path(target)
+    if manifest_path.exists():
+        console.print(
+            f"[yellow]Project already initialized.[/yellow] "
+            f"Manifest at: {manifest_path}"
+        )
+        return
+
+    # Materialize the project dir + empty manifest.
+    _materialize_project_dir(target)
+    console.print(
+        f"[green]✓[/green] Initialized scitoolkit project at "
+        f"[cyan]{target}[/cyan]"
+    )
+    console.print(f"  Manifest: [dim]{manifest_path}[/dim]")
+    console.print(
+        "\nPin toolkits with [cyan]stk install <name>[/cyan] from inside "
+        "this directory."
+    )
+
+
+
 @main.command()
 @click.option(
     '--clean-legacy', is_flag=True, default=False,
@@ -1192,19 +1411,116 @@ def _resolve_toolkit_for_config(toolkit_name: str):
     return yaml_path, schema
 
 
+def _layer_option(f):
+    """Decorator: add ``--layer``/``--user``/``--project`` to a config command.
+
+    Resolves to a single ``layer_flag: Optional[str]`` kwarg with value
+    ``"user"``, ``"project"``, or ``None`` (delegate to context-based
+    default). Mutually exclusive — passing more than one is a usage error.
+    """
+    f = click.option(
+        "--project", "layer_project", is_flag=True, default=False,
+        help="Target the project layer explicitly.",
+    )(f)
+    f = click.option(
+        "--user", "layer_user", is_flag=True, default=False,
+        help="Target the user layer explicitly.",
+    )(f)
+    f = click.option(
+        "--layer", "layer_explicit",
+        type=click.Choice(["user", "project"]), default=None,
+        help="Target a specific config layer (alternative to --user/--project).",
+    )(f)
+    return f
+
+
+def _resolve_config_layer(
+    *,
+    layer_explicit: Optional[str],
+    layer_user: bool,
+    layer_project: bool,
+    default_context: str = "auto",
+) -> Tuple[str, Optional[Path]]:
+    """Resolve the per-command effective layer.
+
+    Returns ``(layer, project_root)`` where ``project_root`` is non-None
+    iff the resolved layer is ``"project"``.
+
+    Priority:
+        1. Explicit ``--layer user|project`` flag.
+        2. Explicit ``--user`` / ``--project`` flag.
+        3. Default: walk discovery. In a project context, default is
+           ``"project"``. In default-project context, default is
+           ``"user"``.
+
+    The default chosen mirrors the brief's lean: "writes go to project
+    in a project; writes go to user in default-project context."
+    """
+    # Conflicts: at most one explicit choice.
+    explicit = []
+    if layer_explicit is not None:
+        explicit.append(layer_explicit)
+    if layer_user:
+        explicit.append("user")
+    if layer_project:
+        explicit.append("project")
+    if len(explicit) > 1:
+        raise click.UsageError(
+            "--layer / --user / --project are mutually exclusive."
+        )
+
+    if explicit:
+        layer = explicit[0]
+    else:
+        # Default: peek at discovery to decide.
+        project_root, source = _resolve_active_project_root()
+        if source == "fallback":
+            return "user", None
+        # In any real project context (walk / override / implicit-create)
+        # the project layer is the default target.
+        return "project", project_root
+
+    # Explicit layer specified.
+    if layer == "project":
+        project_root, _source = _resolve_active_project_root()
+        return "project", project_root
+    return "user", None
+
+
 @config.command(name="path")
 @click.argument("toolkit_name")
-def config_path_cmd(toolkit_name):
-    """Print the absolute path to a toolkit's config file."""
+@_layer_option
+def config_path_cmd(toolkit_name, layer_explicit, layer_user, layer_project):
+    """Print the absolute path to a toolkit's config file.
+
+    Defaults to the active layer for the current context (project layer
+    in a project, user layer in default-project). Override with
+    ``--user``, ``--project``, or ``--layer user|project``.
+    """
     from .setup import config_path as _cfg_path
     _resolve_toolkit_for_config(toolkit_name)  # exits if not installed
-    print(_cfg_path(toolkit_name))
+    layer, project_root = _resolve_config_layer(
+        layer_explicit=layer_explicit,
+        layer_user=layer_user, layer_project=layer_project,
+    )
+    print(_cfg_path(toolkit_name, layer=layer, project_root=project_root))
 
 
 @config.command(name="show")
 @click.argument("toolkit_name")
-def config_show(toolkit_name):
-    """Show a toolkit's stored config (secrets masked)."""
+@_layer_option
+def config_show(toolkit_name, layer_explicit, layer_user, layer_project):
+    """Show a toolkit's effective configuration.
+
+    Default (no flags): merged view of user + project layers, with each
+    key annotated by which layer it came from. Project overrides user
+    key-by-key.
+
+    With ``--layer user|project`` (or ``--user``/``--project``): just
+    that layer's stored values, no merging.
+
+    Secrets are masked. The ``<NEEDS VALUE>`` sentinel surfaces as-is.
+    """
     from .setup import (
         config_path as _cfg_path,
         load_config,
@@ -1212,49 +1528,136 @@ def config_show(toolkit_name):
     )
 
     _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
-    cfg_file = _cfg_path(toolkit_name)
-
-    if not cfg_file.exists():
-        console.print(
-            f"[yellow]No config file yet for {toolkit_name}.[/yellow] "
-            f"({cfg_file})"
-        )
-        if schema and schema.fields:
-            console.print(
-                "Run [cyan]scitoolkit config edit "
-                f"{toolkit_name}[/cyan] to create one, or set fields "
-                "individually with [cyan]config set[/cyan]."
-            )
-        return
-
-    data = load_config(toolkit_name)
     secret_fields = set()
     if schema:
         secret_fields = {
             f.name for f in schema.fields if f.type == "secret"
         }
 
-    console.print(
-        f"\n[bold]{toolkit_name}[/bold] [dim]({cfg_file})[/dim]\n"
-    )
-    if not data:
-        console.print("  [dim](empty)[/dim]")
+    # Detect whether the user asked for a single layer or the merged view.
+    explicit_layer: Optional[str] = None
+    if layer_explicit is not None:
+        explicit_layer = layer_explicit
+    elif layer_user:
+        explicit_layer = "user"
+    elif layer_project:
+        explicit_layer = "project"
+
+    def _fmt_value(key: str, value: Any) -> str:
+        if key in secret_fields and value and value != NEEDS_VALUE_SENTINEL:
+            return "[dim]<set>[/dim]"
+        if value == NEEDS_VALUE_SENTINEL:
+            return f"[yellow]{value}[/yellow]"
+        if isinstance(value, str):
+            return value
+        return repr(value)
+
+    if explicit_layer is not None:
+        # Single-layer view — same shape as 3C-1, no annotation.
+        if explicit_layer == "project":
+            project_root, _source = _resolve_active_project_root()
+            cfg_file = _cfg_path(
+                toolkit_name, layer="project", project_root=project_root,
+            )
+            data = load_config(
+                toolkit_name, layer="project", project_root=project_root,
+            )
+        else:
+            cfg_file = _cfg_path(toolkit_name, layer="user")
+            data = load_config(toolkit_name, layer="user")
+
+        if not cfg_file.exists():
+            console.print(
+                f"[yellow]No {explicit_layer}-layer config file yet for "
+                f"{toolkit_name}.[/yellow] ({cfg_file})"
+            )
+            return
+
+        console.print(
+            f"\n[bold]{toolkit_name}[/bold] [dim]({explicit_layer} layer: "
+            f"{cfg_file})[/dim]\n"
+        )
+        # Skip the schema_version envelope from the displayed body —
+        # it's stamped on save but isn't a config value.
+        body = {k: v for k, v in data.items() if k != "schema_version"}
+        if not body:
+            console.print("  [dim](empty)[/dim]")
+            return
+        for key, value in body.items():
+            console.print(
+                f"  [cyan]{key}[/cyan]: {_fmt_value(key, value)}"
+            )
         return
 
-    for key, value in data.items():
-        if key in secret_fields and value and value != NEEDS_VALUE_SENTINEL:
-            display = "[dim]<set>[/dim]"
-        elif value == NEEDS_VALUE_SENTINEL:
-            display = f"[yellow]{value}[/yellow]"
+    # Default: merged view with per-key layer annotations.
+    project_root, source = _resolve_active_project_root()
+    user_file = _cfg_path(toolkit_name, layer="user")
+    project_file = _cfg_path(
+        toolkit_name, layer="project", project_root=project_root,
+    )
+
+    user_data = load_config(toolkit_name, layer="user")
+    project_data = load_config(
+        toolkit_name, layer="project", project_root=project_root,
+    )
+
+    # Strip schema_version envelopes before merging.
+    user_body = {k: v for k, v in user_data.items() if k != "schema_version"}
+    project_body = {
+        k: v for k, v in project_data.items() if k != "schema_version"
+    }
+
+    if not user_body and not project_body:
+        console.print(
+            f"[yellow]No config file yet for {toolkit_name}.[/yellow]"
+        )
+        console.print(f"  User layer:    {user_file}")
+        console.print(f"  Project layer: {project_file}")
+        if schema and schema.fields:
+            console.print(
+                "\nRun [cyan]scitoolkit config edit "
+                f"{toolkit_name}[/cyan] to create one, or set fields "
+                "individually with [cyan]config set[/cyan]."
+            )
+        return
+
+    # Merge for display order: union of keys, project values winning.
+    # Order: user keys first (in file order), then project-only keys.
+    all_keys: List[str] = list(user_body.keys())
+    for k in project_body:
+        if k not in all_keys:
+            all_keys.append(k)
+
+    project_label = "default-project" if source == "fallback" else "project"
+    console.print(f"\n[bold]{toolkit_name}[/bold]")
+    console.print(f"  user layer:    [dim]{user_file}[/dim]")
+    console.print(
+        f"  {project_label} layer: [dim]{project_file}[/dim]"
+    )
+    console.print()
+
+    for key in all_keys:
+        if key in project_body:
+            value = project_body[key]
+            layer_tag = "project"
         else:
-            display = repr(value) if not isinstance(value, str) else value
-        console.print(f"  [cyan]{key}[/cyan]: {display}")
+            value = user_body[key]
+            layer_tag = "user"
+        console.print(
+            f"  [cyan]{key}[/cyan]: {_fmt_value(key, value)}  "
+            f"[dim]# from {layer_tag}[/dim]"
+        )
 
 
 @config.command(name="edit")
 @click.argument("toolkit_name")
-def config_edit(toolkit_name):
+@_layer_option
+def config_edit(toolkit_name, layer_explicit, layer_user, layer_project):
     """Open the toolkit's config file in $EDITOR.
+
+    Defaults to the project layer in a project context, the user layer
+    in default-project context. Override with ``--user``, ``--project``,
+    or ``--layer user|project``.
 
     If the file doesn't exist yet, a template is dropped first so the
     user lands in a populated buffer. Falls back to nano then vi if
@@ -1269,30 +1672,54 @@ def config_edit(toolkit_name):
     )
 
     _resolve_toolkit_for_config(toolkit_name)  # validates install
-    cfg_file = _cfg_path(toolkit_name)
+    layer, project_root = _resolve_config_layer(
+        layer_explicit=layer_explicit,
+        layer_user=layer_user, layer_project=layer_project,
+    )
+    cfg_file = _cfg_path(
+        toolkit_name, layer=layer, project_root=project_root,
+    )
 
-    # Drop a template if the file doesn't exist yet.
+    # Drop a template if the file doesn't exist yet. Templates are only
+    # populated against the toolkit's declared schema for the user layer
+    # — the project layer is meant for sparse overrides, so we leave it
+    # empty (a comment hint is enough).
     if not cfg_file.exists():
-        _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
-        if schema:
-            existing = load_config(toolkit_name)
-            for f in schema.fields:
-                if f.name in existing:
-                    continue
-                if f.default is not None:
-                    existing[f.name] = f.default
-                elif f.required:
-                    existing[f.name] = NEEDS_VALUE_SENTINEL
-            save_config(toolkit_name, existing)
+        if layer == "user":
+            _yaml_path, schema = _resolve_toolkit_for_config(toolkit_name)
+            if schema:
+                existing = load_config(toolkit_name, layer=layer)
+                for f in schema.fields:
+                    if f.name in existing:
+                        continue
+                    if f.default is not None:
+                        existing[f.name] = f.default
+                    elif f.required:
+                        existing[f.name] = NEEDS_VALUE_SENTINEL
+                save_config(
+                    toolkit_name, existing,
+                    layer=layer, project_root=project_root,
+                )
+            else:
+                cfg_file.parent.mkdir(parents=True, exist_ok=True)
+                cfg_file.touch()
+                try:
+                    os.chmod(cfg_file, 0o600)
+                except (OSError, NotImplementedError):
+                    pass
         else:
-            # No schema — just create an empty file so $EDITOR has
-            # something to open.
-            cfg_file.parent.mkdir(parents=True, exist_ok=True)
-            cfg_file.touch()
-            try:
-                os.chmod(cfg_file, 0o600)
-            except (OSError, NotImplementedError):
-                pass
+            # Project layer: drop an empty schema-versioned file with a
+            # header comment hint. Users add only the keys they want to
+            # override.
+            save_config(
+                toolkit_name, {},
+                layer="project", project_root=project_root,
+                header_comment=(
+                    f"Project-layer config for {toolkit_name}.\n"
+                    "Only fields set here override the user layer; "
+                    "other fields fall through to ~/.scitoolkit/config/."
+                ),
+            )
 
     editor = os.environ.get("EDITOR") or shutil.which("nano") or shutil.which("vi")
     if not editor:
@@ -1314,8 +1741,23 @@ def config_edit(toolkit_name):
 @click.argument("toolkit_name")
 @click.argument("key")
 @click.argument("value")
-def config_set(toolkit_name, key, value):
-    """Set one config field on a toolkit (preserves other fields/comments)."""
+@_layer_option
+def config_set(
+    toolkit_name, key, value,
+    layer_explicit, layer_user, layer_project,
+):
+    """Set one config field on a toolkit (preserves other fields/comments).
+
+    Default target layer:
+        - In a project context (``.scitoolkit/`` discovered upward, or
+          ``--project-dir`` override): the *project* layer. Smaller
+          diffs in git, clearer intent — the project layer file is
+          created with just this one key if it didn't exist.
+        - In default-project context (no project anywhere upward): the
+          *user* layer.
+
+    Override with ``--user``, ``--project``, or ``--layer user|project``.
+    """
     from .setup import (
         config_path as _cfg_path,
         coerce_value,
@@ -1341,28 +1783,54 @@ def config_set(toolkit_name, key, value):
                 console.print(f"[red]✗ {e}[/red]")
                 sys.exit(1)
 
-    set_config_value(toolkit_name, key, parsed)
+    layer, project_root = _resolve_config_layer(
+        layer_explicit=layer_explicit,
+        layer_user=layer_user, layer_project=layer_project,
+    )
+    set_config_value(
+        toolkit_name, key, parsed,
+        layer=layer, project_root=project_root,
+    )
+    cfg_file = _cfg_path(
+        toolkit_name, layer=layer, project_root=project_root,
+    )
     console.print(
-        f"[green]✓[/green] {toolkit_name}.{key} set "
-        f"[dim]({_cfg_path(toolkit_name)})[/dim]"
+        f"[green]✓[/green] {toolkit_name}.{key} set in {layer} layer "
+        f"[dim]({cfg_file})[/dim]"
     )
 
 
 @config.command(name="unset")
 @click.argument("toolkit_name")
 @click.argument("key")
-def config_unset(toolkit_name, key):
-    """Remove one config field from a toolkit's config file."""
+@_layer_option
+def config_unset(
+    toolkit_name, key,
+    layer_explicit, layer_user, layer_project,
+):
+    """Remove one config field from a toolkit's config file.
+
+    Same default-layer rules as ``config set``.
+    """
     from .setup import unset_config_value
 
     _resolve_toolkit_for_config(toolkit_name)
-    removed = unset_config_value(toolkit_name, key)
+    layer, project_root = _resolve_config_layer(
+        layer_explicit=layer_explicit,
+        layer_user=layer_user, layer_project=layer_project,
+    )
+    removed = unset_config_value(
+        toolkit_name, key, layer=layer, project_root=project_root,
+    )
     if removed:
-        console.print(f"[green]✓[/green] removed {toolkit_name}.{key}")
+        console.print(
+            f"[green]✓[/green] removed {toolkit_name}.{key} from "
+            f"{layer} layer"
+        )
     else:
         console.print(
             f"[yellow]No such field {key!r} in {toolkit_name}'s "
-            "config.[/yellow]"
+            f"{layer}-layer config.[/yellow]"
         )
 
 
@@ -1380,7 +1848,12 @@ def config_validate(toolkit_name):
         )
         return
 
-    resolution = load_state_config(toolkit_name, schema)
+    # Validate the merged user+project view — same view the orchestrator
+    # uses at serve startup.
+    project_root, _source = _resolve_active_project_root()
+    resolution = load_state_config(
+        toolkit_name, schema, project_root=project_root,
+    )
     if resolution.ok:
         n = len(resolution.state_config)
         console.print(
@@ -2576,17 +3049,27 @@ def install(name, version, no_skills, yes, no_, no_input):
     except Exception:
         pass
 
-    # Pin into the default-project manifest. Real per-project discovery
-    # arrives in Phase 3; until then ``stk install`` always pins into
-    # the implicit global project. The cache slot itself is project-
-    # agnostic; only the pin is per-project.
+    # Pin into the active project's manifest. Phase 3 wires real
+    # per-project discovery via ``_resolve_active_project_root``: walk
+    # upward looking for ``.scitoolkit/manifest.yaml``; if none found
+    # and we're in a TTY, ask whether to create one in cwd; otherwise
+    # silently fall back to ``~/.scitoolkit/default-project/``. The
+    # cache slot itself is project-agnostic; only the pin is per-project.
     try:
         from .envs import (
-            default_project_root as _default_project_root,
             project_manifest_path as _project_manifest_path,
             add_pin as _add_pin,
         )
-        manifest_path = _project_manifest_path(_default_project_root())
+        project_root, _source = _resolve_active_project_root(
+            allow_implicit_create=True,
+            mode=mode,
+            create_message=(
+                f"No .scitoolkit/ found above {Path.cwd()}. Create one here "
+                "to pin this toolkit to the project? (No = pin to global "
+                "default-project)"
+            ),
+        )
+        manifest_path = _project_manifest_path(project_root)
         _add_pin(manifest_path, name, version)
     except Exception as e:
         # Manifest pinning is best-effort during Phase 2; serve will
@@ -2927,7 +3410,6 @@ def uninstall(name, yes, no_, no_input):
         walk_cache as _walk_cache,
         list_versions as _list_versions,
         find_slot as _find_slot,
-        default_project_root as _default_project_root,
         project_manifest_path as _project_manifest_path,
         remove_pin as _remove_pin,
     )
@@ -3012,20 +3494,25 @@ def uninstall(name, yes, no_, no_input):
         except OSError:
             pass
 
-    # Update the default-project manifest.
+    # Update the active project's manifest.
     #
     # - ``uninstall <name>``: remove the pin entirely.
     # - ``uninstall <name>@<ver>``: if any other version remains, leave
     #   the pin alone (still valid, even if we just unpinned one slot).
     #   If no versions remain, remove the pin.
+    #
+    # Uninstall never implicitly creates a project: if cwd isn't in one,
+    # we silently fall back to default-project (which is where ``install``
+    # would have pinned in the no-project case anyway).
     try:
-        manifest_path = _project_manifest_path(_default_project_root())
+        project_root, _source = _resolve_active_project_root()
+        manifest_path = _project_manifest_path(project_root)
         remaining = _list_versions(name)
         if not remaining:
             _remove_pin(manifest_path, name)
     except Exception as e:
         console.print(
-            f"[dim]Note: could not update default-project manifest: {e}[/dim]"
+            f"[dim]Note: could not update project manifest: {e}[/dim]"
         )
 
     # Skills cleanup — only when ALL versions are gone.

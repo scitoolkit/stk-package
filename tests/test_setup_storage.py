@@ -75,7 +75,11 @@ def test_load_missing_returns_empty(isolated_config: Path):
 def test_save_then_load_round_trip(isolated_config: Path):
     storage.save_config("demo", {"api_key": "sct_user_xx", "count": 4})
     data = storage.load_config("demo")
-    assert dict(data) == {"api_key": "sct_user_xx", "count": 4}
+    # 0.5.0: schema_version: 1 is stamped on every save. Strip the
+    # envelope from the comparison; we care about the body.
+    body = {k: v for k, v in data.items() if k != "schema_version"}
+    assert body == {"api_key": "sct_user_xx", "count": 4}
+    assert data["schema_version"] == 1
 
 
 def test_save_sets_0600_on_posix(isolated_config: Path):
@@ -154,14 +158,16 @@ def test_set_config_value_preserves_other_fields(isolated_config: Path):
     storage.save_config("demo", {"a": 1, "b": 2})
     storage.set_config_value("demo", "a", 99)
     data = storage.load_config("demo")
-    assert dict(data) == {"a": 99, "b": 2}
+    body = {k: v for k, v in data.items() if k != "schema_version"}
+    assert body == {"a": 99, "b": 2}
 
 
 def test_unset_config_value_removes_field(isolated_config: Path):
     storage.save_config("demo", {"a": 1, "b": 2})
     removed = storage.unset_config_value("demo", "a")
     assert removed is True
-    assert dict(storage.load_config("demo")) == {"b": 2}
+    body = {k: v for k, v in storage.load_config("demo").items() if k != "schema_version"}
+    assert body == {"b": 2}
 
 
 def test_unset_config_value_missing_key_returns_false(isolated_config: Path):

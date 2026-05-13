@@ -248,6 +248,7 @@ def load_state_config(
     schema: ConfigSchema,
     *,
     base: Optional[Path] = None,
+    project_root: Optional[Path] = None,
 ) -> StateConfigResolution:
     """Read the toolkit's stored config and validate it against the schema.
 
@@ -255,6 +256,12 @@ def load_state_config(
     whether to serve the toolkit and (if so) what state values to
     inject. Never raises; the orchestrator wants a clean go/no-go
     answer it can render in the startup banner.
+
+    Phase 4 (0.5.0): if ``project_root`` is supplied, the project layer
+    at ``<project_root>/.scitoolkit/config/<toolkit>.yaml`` is read and
+    merged on top of the user layer (project wins key-by-key). When
+    ``project_root`` is ``None`` (the legacy / test path), only the
+    user layer is consulted — matching the 0.4.x behavior.
 
     Optional fields:
         - With a stored value → validated, included in state_config.
@@ -269,7 +276,26 @@ def load_state_config(
     """
     resolution = StateConfigResolution()
     try:
-        stored = load_config(toolkit_name, base=base)
+        user_stored = load_config(toolkit_name, base=base)
+        if project_root is not None:
+            project_stored = load_config(
+                toolkit_name, base=base,
+                layer="project", project_root=project_root,
+            )
+            # Merge: user → project; project wins key-by-key. We use a
+            # plain dict here because we don't need to preserve comments
+            # at this stage — the merged view is consumed as data.
+            stored = dict(user_stored)
+            for k, v in project_stored.items():
+                if k == "schema_version":
+                    continue
+                stored[k] = v
+        else:
+            stored = user_stored
+        # The schema_version envelope is a file-format concern, never a
+        # state field. Strip it before validation / pass-through.
+        if "schema_version" in stored:
+            stored = {k: v for k, v in stored.items() if k != "schema_version"}
     except ValueError as e:
         # Malformed YAML — treat as "everything missing." The
         # orchestrator surfaces this as a skip with the parse error.

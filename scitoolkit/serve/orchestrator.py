@@ -165,7 +165,6 @@ def discover_toolkits(toolkits_dir: Optional[Path] = None) -> List[ToolkitDiscov
 
     from ..envs import (
         walk_cache,
-        default_project_root,
         project_manifest_path,
         load_manifest,
     )
@@ -175,11 +174,14 @@ def discover_toolkits(toolkits_dir: Optional[Path] = None) -> List[ToolkitDiscov
     if not entries:
         return []
 
-    # Read the active project's manifest. Phase 2 always uses the
-    # default-project; Phase 3 wires real discovery.
+    # Read the active project's manifest. Phase 3 wires real discovery
+    # via ``_resolve_active_project_root`` (in cli.py); we import it
+    # lazily to avoid a circular dependency at module load.
     pin_by_name: Dict[str, str] = {}
     try:
-        manifest_path = project_manifest_path(default_project_root())
+        from ..cli import _resolve_active_project_root
+        project_root, _source = _resolve_active_project_root()
+        manifest_path = project_manifest_path(project_root)
         manifest = load_manifest(manifest_path)
         for e in manifest.toolkits:
             pin_by_name[e.name] = e.version
@@ -344,7 +346,18 @@ def _resolve_state_config(
         except Exception as e:
             return None, f"invalid config: schema in toolkit.yaml: {e}"
 
-        resolution = load_state_config(disc.name, schema)
+        # Phase 4 (0.5.0): resolve via two-layer user→project merge.
+        # Discovery of the active project is delegated to the CLI helper
+        # (lazy-imported here to avoid a circular at module load).
+        try:
+            from ..cli import _resolve_active_project_root
+            project_root, _source = _resolve_active_project_root()
+        except Exception:
+            project_root = None
+
+        resolution = load_state_config(
+            disc.name, schema, project_root=project_root,
+        )
         if not resolution.ok:
             return None, "config incomplete — " + (resolution.skip_reason() or "unknown")
         state_config = dict(resolution.state_config)

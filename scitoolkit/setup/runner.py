@@ -939,7 +939,7 @@ def _resolve_toolkit_dir(
 
     # 0.5.0 cache walk.
     from ..envs import (
-        list_versions, find_slot, default_project_root,
+        list_versions, find_slot,
         project_manifest_path, get_pin,
     )
     from ..versioning import parse_version
@@ -951,10 +951,12 @@ def _resolve_toolkit_dir(
             "~/.scitoolkit/cache/)"
         )
 
-    # Prefer the pin from the default-project manifest (Phase 3 wires
-    # real per-project discovery).
+    # Prefer the pin from the active project's manifest (Phase 3:
+    # walk-upward discovery via cli._resolve_active_project_root).
     try:
-        manifest_path = project_manifest_path(default_project_root())
+        from ..cli import _resolve_active_project_root
+        project_root, _source = _resolve_active_project_root()
+        manifest_path = project_manifest_path(project_root)
         pin = get_pin(manifest_path, toolkit_name)
     except Exception:
         pin = None
