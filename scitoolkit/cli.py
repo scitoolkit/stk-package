@@ -215,7 +215,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.0", prog_name="scitoolkit")
+@click.version_option(version="0.5.1", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -3976,6 +3976,16 @@ class _ServeGroup(click.Group):
     ),
 )
 @click.option(
+    '--enable-group', 'enable_group', multiple=True, metavar='TOOLKIT__GROUP',
+    help=(
+        'Serve only tools belonging to the named tool group within that '
+        'toolkit (one-shot). Requires the toolkit to declare a '
+        'tool_groups: block in its toolkit.yaml. If the group is currently '
+        'unavailable (missing required config keys) or undeclared, a clear '
+        'reason is surfaced at startup without crashing. Repeatable.'
+    ),
+)
+@click.option(
     '--dry-run', '-d', 'dry_run', is_flag=True, default=False,
     help='Print the resolved serve set and exit without starting the server.',
 )
@@ -3993,7 +4003,7 @@ class _ServeGroup(click.Group):
     help='Run without TUI. Currently the only supported mode.',
 )
 @click.pass_context
-def serve(ctx, toolkits_flag, group_name, enable_tool, disable_tool, dry_run, call_timeout, no_tui):
+def serve(ctx, toolkits_flag, group_name, enable_tool, disable_tool, enable_group, dry_run, call_timeout, no_tui):
     """
     Start the MCP server for installed toolkits.
 
@@ -4063,6 +4073,7 @@ def serve(ctx, toolkits_flag, group_name, enable_tool, disable_tool, dry_run, ca
             group_name=group_name,
             enable_tools=list(enable_tool),
             disable_tools=list(disable_tool),
+            enable_groups=list(enable_group),
         )
     except ServeConfigError as e:
         console.print(f"[red]{e}[/red]")
@@ -4076,6 +4087,7 @@ def serve(ctx, toolkits_flag, group_name, enable_tool, disable_tool, dry_run, ca
     # (serve everything, no resolver). Only thread the resolved set when
     # the user actually narrowed something.
     narrowed = bool(toolkits or group_name or enable_tool or disable_tool
+                    or enable_group
                     or cfg.default.disabled_toolkits or cfg.default.disabled_tools)
 
     # The MCP stdio protocol owns this process's stdin/stdout, so we do NOT

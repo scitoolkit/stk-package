@@ -421,6 +421,125 @@ def _read_tools_spec(toolkit_path: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _read_tool_groups_and_membership(
+    toolkit_path: Path,
+) -> Tuple[Optional[Dict[str, Dict[str, Any]]], Dict[str, Optional[str]]]:
+    """Extract the ``tool_groups:`` block and per-tool group membership.
+
+    Returns ``(tool_groups_block, name_to_group)``:
+
+    - ``tool_groups_block``: the parsed ``tool_groups:`` mapping, or
+      ``None`` if the toolkit doesn't declare one (backward compat —
+      no gating in that case).
+    - ``name_to_group``: tool name → group name (or ``None`` for tools
+      that don't declare a group). Empty if the yaml is missing or
+      malformed (gate-evaluation falls back to "all served").
+
+    Defensive reading: any malformed shape returns the safe fallback
+    (no block, empty membership), matching how ``_read_tools_spec``
+    handles parse failures.
+    """
+    yaml_path = toolkit_path / "toolkit.yaml"
+    if not yaml_path.is_file():
+        return None, {}
+    try:
+        import yaml as pyyaml
+        data = pyyaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, {}
+    if not isinstance(data, dict):
+        return None, {}
+
+    raw_block = data.get("tool_groups")
+    tool_groups_block: Optional[Dict[str, Dict[str, Any]]] = None
+    if isinstance(raw_block, dict) and raw_block:
+        # Keep only mapping-shaped entries; ignore malformed ones rather
+        # than failing the whole serve startup. Validation at publish
+        # time is the gate for shape correctness.
+        cleaned_block: Dict[str, Dict[str, Any]] = {}
+        for gname, gentry in raw_block.items():
+            if not isinstance(gname, str):
+                continue
+            if isinstance(gentry, dict):
+                cleaned_block[gname] = dict(gentry)
+            elif gentry is None:
+                # YAML ``foo:`` with no value parses as None — treat
+                # as an empty group entry (no requires).
+                cleaned_block[gname] = {}
+        if cleaned_block:
+            tool_groups_block = cleaned_block
+
+    name_to_group: Dict[str, Optional[str]] = {}
+    tools = data.get("tools") if isinstance(data, dict) else None
+    if isinstance(tools, list):
+        for entry in tools:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = entry.get("name")
+            if not isinstance(tool_name, str):
+                continue
+            group = entry.get("group")
+            if isinstance(group, str) and group:
+                name_to_group[tool_name] = group
+            else:
+                name_to_group[tool_name] = None
+
+    return tool_groups_block, name_to_group
+
+
+def _resolve_group_availability(
+    disc: "ToolkitDiscovery",
+) -> Tuple[Any, Dict[str, Optional[str]]]:
+    """Evaluate this toolkit's ``tool_groups:`` against its resolved config.
+
+    Returns ``(GroupAvailability, name_to_group)``. The orchestrator
+    uses ``GroupAvailability.is_group_available(group)`` per tool at
+    spawn time to decide whether to expose it.
+
+    Resolution sourcing: same two-layer user→project merge that the
+    Phase 3C-1 declarative path uses, via
+    ``envs.config.resolve_toolkit_config``. Project layer overrides
+    user layer key-by-key (see ``envs/config.py``). The ``<NEEDS
+    VALUE>`` sentinel counts as unset, matching the existing
+    state-config gate semantics one level up.
+
+    On any read failure (no toolkit.yaml, malformed file, etc.),
+    returns an empty availability that gates nothing — pass-through
+    behavior so a broken yaml doesn't take down all toolkits.
+    """
+    from .tool_groups import (
+        GroupAvailability,
+        evaluate_tool_groups,
+    )
+
+    tool_groups_block, name_to_group = _read_tool_groups_and_membership(
+        disc.path
+    )
+
+    # Resolve the two-layer config for this toolkit. The active project
+    # root is resolved via the CLI helper (lazy import to break the
+    # circular dependency; see HANDOFF.md gotcha #17).
+    resolved_config: Dict[str, Any] = {}
+    try:
+        from ..envs.config import resolve_toolkit_config
+        try:
+            from ..cli import _resolve_active_project_root
+            project_root, _src = _resolve_active_project_root()
+        except Exception:
+            project_root = None
+        if project_root is not None:
+            resolved_config = resolve_toolkit_config(
+                disc.name, project_root,
+            )
+    except Exception:
+        # Pass-through on any error — better to over-serve than block
+        # startup over a config-resolution glitch.
+        resolved_config = {}
+
+    availability = evaluate_tool_groups(tool_groups_block, resolved_config)
+    return availability, name_to_group
+
+
 def _build_host_command(
     disc: ToolkitDiscovery,
     *,
@@ -825,6 +944,7 @@ class Orchestrator:
         # Build proxies from the canonical MCP listing (richer schema info
         # than the bare tool name list in the handshake).
         from .proxy_tool import make_proxy_tool
+        from .tool_groups import format_skip_log_line
 
         # Determine which tools from this toolkit to actually expose.
         # `tool_filter` is one of:
@@ -843,6 +963,60 @@ class Orchestrator:
                 if q.startswith(f"{disc.name}__"):
                     tool_disable_set.add(q.split("__", 1)[1])
 
+        # 0.5.1: evaluate tool_groups against the resolved two-layer
+        # config. Tools whose ``group:`` field names an unavailable
+        # group are dropped from the served set. One stderr line per
+        # dropped group, fired once at startup (NOT per call).
+        availability, name_to_group = _resolve_group_availability(disc)
+        if availability.dropped_groups:
+            # ``--enable-group <tk>__<group>`` requests for unavailable
+            # groups on this toolkit are surfaced separately below; the
+            # logging here covers the implicit-drop case.
+            for gname, missing in availability.dropped_groups.items():
+                line = format_skip_log_line(disc.name, gname, missing)
+                # stderr console for visibility + serve.log for grepping.
+                self.console.print(f"  [yellow]⊘[/yellow] [dim]{line}[/dim]")
+                self.logger.log_event(
+                    "group_skipped",
+                    toolkit=disc.name,
+                    group=gname,
+                    reason="missing_config",
+                    missing_keys=",".join(missing),
+                    level="warn",
+                )
+
+        # If --enable-group requested specific groups for this toolkit,
+        # translate that into a per-tool allowlist (filter to tools
+        # whose group: is in the requested set). Unavailable requested
+        # groups produce a clear stderr message but don't crash serve.
+        requested_groups: Optional[List[str]] = None
+        if self._resolved is not None:
+            requested = self._resolved.enable_groups.get(disc.name)
+            if requested is not None:
+                requested_groups = list(requested)
+                unavailable = [
+                    g for g in requested_groups
+                    if g in availability.dropped_groups
+                ]
+                undeclared = [
+                    g for g in requested_groups
+                    if g not in availability.dropped_groups
+                    and g not in availability.available_groups
+                ]
+                for g in unavailable:
+                    missing = availability.dropped_groups.get(g, [])
+                    self.console.print(
+                        f"  [red]✗[/red] [dim]{disc.name}__{g}:[/dim] "
+                        f"[red]group not available — "
+                        f"missing config keys [{', '.join(missing)}][/red]"
+                    )
+                for g in undeclared:
+                    self.console.print(
+                        f"  [red]✗[/red] [dim]{disc.name}__{g}:[/dim] "
+                        f"[red]group not declared in toolkit.yaml's "
+                        f"tool_groups: block[/red]"
+                    )
+
         # Forwarder is bound to the toolkit *name*, not the client. The
         # forwarder looks up the live MCPClient on every call so a restart
         # that swaps the client is picked up transparently.
@@ -854,6 +1028,18 @@ class Orchestrator:
                 continue
             if upstream_name in tool_disable_set:
                 continue
+            # tool_groups gating: drop tools belonging to unavailable
+            # groups. Tools without a group: field always pass.
+            tool_group = name_to_group.get(upstream_name)
+            if not availability.is_group_available(tool_group):
+                continue
+            # --enable-group narrowing: when active for this toolkit,
+            # only tools whose group: is in the requested set are
+            # served. Tools without a group: field are dropped under
+            # this mode (the user opted into a curated subset).
+            if requested_groups is not None:
+                if tool_group is None or tool_group not in requested_groups:
+                    continue
             namespaced = f"{disc.name}__{upstream_name}"
             self._proxy_tools.append(make_proxy_tool(
                 upstream_name=upstream_name,

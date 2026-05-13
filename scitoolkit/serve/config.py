@@ -176,6 +176,12 @@ class ResolvedSet:
     # orchestrator subtracts these at spawn time when ``tools[tk] is None``,
     # i.e. when no allowlist is active for that toolkit.
     disable_qualified: List[str] = field(default_factory=list)
+    # 0.5.1: per-toolkit requested tool-groups (from --enable-group).
+    # Maps toolkit name → list of group names the user explicitly
+    # requested. The orchestrator evaluates each against the toolkit's
+    # ``tool_groups:`` block and surfaces a clear message if a
+    # requested group is currently unavailable or undeclared.
+    enable_groups: Dict[str, List[str]] = field(default_factory=dict)
 
 
 def _split_tool(qualified: str) -> Tuple[str, str]:
@@ -200,6 +206,7 @@ def resolve_serve_set(
     group_name: Optional[str] = None,
     enable_tools: List[str] = (),
     disable_tools: List[str] = (),
+    enable_groups: List[str] = (),
 ) -> ResolvedSet:
     """Pure resolver: turn flags + config + installed list into a serve set.
 
@@ -357,12 +364,49 @@ def resolve_serve_set(
             final_toolkits.append(tk)
 
     disable_qualified = [f"{tk}__{t}" for tk, t in disable_pairs]
+
+    # ── --enable-group: per-toolkit requested groups ────────────────────
+    # Format: ``TOOLKIT__GROUP``. Each entry asks the orchestrator to
+    # serve the named group's tools within that toolkit. If the toolkit
+    # isn't in the resolved set, that's an error (the user can't ask
+    # for groups from a toolkit they're not serving). If the group is
+    # currently unavailable (its ``requires:`` aren't satisfied) or
+    # undeclared, the orchestrator surfaces a clear message at spawn
+    # time — we just collect the request here without crashing.
+    enable_groups_map: Dict[str, List[str]] = {}
+    final_toolkit_set: Set[str] = set(final_toolkits)
+    for q in enable_groups:
+        if "__" not in q:
+            raise ServeConfigError(
+                f"--enable-group '{q}' must be in 'toolkit__group' form"
+            )
+        tk, _, gname = q.partition("__")
+        if not tk or not gname:
+            raise ServeConfigError(
+                f"--enable-group '{q}' must be in 'toolkit__group' form"
+            )
+        if tk not in final_toolkit_set:
+            raise ServeConfigError(
+                f"Cannot enable group '{q}' — toolkit '{tk}' is not in "
+                "this serve session."
+            )
+        enable_groups_map.setdefault(tk, []).append(gname)
+    if enable_groups_map:
+        path.append(
+            "--enable-group: " + ", ".join(
+                f"{tk}__{g}"
+                for tk, gs in enable_groups_map.items()
+                for g in gs
+            )
+        )
+
     return ResolvedSet(
         toolkits=final_toolkits,
         tools=tools_resolved,
         warnings=warnings,
         resolution_path=path,
         disable_qualified=disable_qualified,
+        enable_groups=enable_groups_map,
     )
 
 

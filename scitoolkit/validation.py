@@ -173,6 +173,18 @@ class ToolDefinition(BaseModel):
             "docstring at serve time)."
         ),
     )
+    group: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional tool-group name. When the toolkit declares a "
+            "``tool_groups:`` block (0.5.1+), this tool participates in "
+            "the named group's conditional-availability evaluation. A "
+            "tool whose group's ``requires:`` config keys are not all "
+            "set is silently dropped from serve's tool list at startup. "
+            "Tools without a ``group:`` field are always served, "
+            "regardless of any ``tool_groups:`` declarations."
+        ),
+    )
 
     @field_validator('name')
     @classmethod
@@ -180,6 +192,19 @@ class ToolDefinition(BaseModel):
         """Validate tool name format."""
         if not v.replace('_', '').replace('-', '').isalnum():
             raise ValueError('Tool name must be alphanumeric (underscores and hyphens allowed)')
+        return v
+
+    @field_validator('group')
+    @classmethod
+    def validate_group(cls, v):
+        """Validate group identifier format (same shape as tool names)."""
+        if v is None:
+            return v
+        if not v.replace('_', '').replace('-', '').isalnum():
+            raise ValueError(
+                "Tool group name must be alphanumeric (underscores and "
+                "hyphens allowed)"
+            )
         return v
 
     @model_validator(mode="after")
@@ -252,6 +277,28 @@ class ToolkitMetadata(BaseModel):
             "in Phase 3C-2."
         ),
     )
+    # ── 0.5.1: optional conditional tool-group availability ───────────
+    #
+    # Each entry maps a group name → a mapping that currently supports
+    # one key: ``requires: [<config_key>, ...]``. A group whose
+    # ``requires:`` config keys are not all set in the resolved two-layer
+    # toolkit config is silently dropped at serve startup, and tools
+    # belonging to it via their ``group:`` field are removed from the
+    # exposed tool list. Tools without a ``group:`` field are always
+    # served. Toolkits without a ``tool_groups:`` block keep working
+    # exactly as in 0.5.0 (no gating, all groups loaded).
+    tool_groups: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Optional named tool-group declarations. Each group may "
+            "declare ``requires: [<config_key>, ...]`` referencing keys "
+            "in the toolkit's own ``config:`` block. At serve startup, "
+            "groups whose required keys are not set in the resolved "
+            "two-layer toolkit config are silently dropped; tools whose "
+            "``group:`` field names a dropped group are removed from "
+            "the served set."
+        ),
+    )
     tools: List[ToolDefinition] = Field(..., description="List of tools in this toolkit")
 
     @field_validator('name')
@@ -309,6 +356,96 @@ class ToolkitMetadata(BaseModel):
             raise ValueError(f'Category must be one of: {", ".join(allowed_categories)}')
 
         return v.lower()
+
+    @model_validator(mode="after")
+    def _validate_tool_groups(self):
+        """Validate ``tool_groups:`` shape and cross-references.
+
+        Checks (run at validate / publish time so authoring mistakes
+        surface before users see them):
+
+        1. Each entry under ``tool_groups`` is a mapping (yaml shape).
+        2. The only recognized key inside a group entry is ``requires``;
+           unknown keys are rejected so typos like ``require:`` don't
+           silently no-op.
+        3. ``requires:`` is a list of strings.
+        4. Every key listed under ``requires:`` is also declared in this
+           toolkit's ``config:`` block. Catches typos at publish, not at
+           serve.
+        5. Every tool's ``group:`` field (when set) names a group that
+           exists in ``tool_groups``.
+        """
+        if not self.tool_groups:
+            # Backward compat: no tool_groups block → nothing to check.
+            # Per-tool ``group:`` fields without a tool_groups block are
+            # harmless metadata (groups have no semantic gate). If a
+            # toolkit author wants those to start gating, they add the
+            # tool_groups block at the same time.
+            return self
+
+        # Build the set of config-block keys to check requires references.
+        config_keys = set()
+        if self.config:
+            for entry in self.config:
+                if isinstance(entry, dict):
+                    key = entry.get("name") or entry.get("key")
+                    if isinstance(key, str):
+                        config_keys.add(key)
+
+        for group_name, group_entry in self.tool_groups.items():
+            if not isinstance(group_name, str) or not group_name:
+                raise ValueError(
+                    f"tool_groups: group name must be a non-empty string, "
+                    f"got {group_name!r}"
+                )
+            if not group_name.replace('_', '').replace('-', '').isalnum():
+                raise ValueError(
+                    f"tool_groups: group name '{group_name}' must be "
+                    "alphanumeric (underscores and hyphens allowed)"
+                )
+            if not isinstance(group_entry, dict):
+                raise ValueError(
+                    f"tool_groups['{group_name}']: must be a mapping "
+                    f"(got {type(group_entry).__name__})"
+                )
+            unknown = set(group_entry.keys()) - {"requires"}
+            if unknown:
+                raise ValueError(
+                    f"tool_groups['{group_name}']: unknown key(s) "
+                    f"{sorted(unknown)}. Only 'requires:' is recognized "
+                    "in this version."
+                )
+            requires = group_entry.get("requires", [])
+            if not isinstance(requires, list):
+                raise ValueError(
+                    f"tool_groups['{group_name}'].requires: must be a list "
+                    f"of config-key names, got {type(requires).__name__}"
+                )
+            for entry in requires:
+                if not isinstance(entry, str) or not entry:
+                    raise ValueError(
+                        f"tool_groups['{group_name}'].requires: each "
+                        f"entry must be a non-empty string, got {entry!r}"
+                    )
+                if entry not in config_keys:
+                    raise ValueError(
+                        f"tool_groups['{group_name}'].requires references "
+                        f"config key '{entry}' which is not declared in "
+                        f"this toolkit's config: block. Declare the key "
+                        "in config: or remove it from requires:."
+                    )
+
+        # Each tool's ``group:`` must reference a declared group.
+        declared = set(self.tool_groups.keys())
+        for tool in self.tools:
+            if tool.group is not None and tool.group not in declared:
+                raise ValueError(
+                    f"tool '{tool.name}' has group: '{tool.group}' but "
+                    f"that group is not declared in tool_groups. "
+                    f"Declared groups: {sorted(declared) or '(none)'}."
+                )
+
+        return self
 
 
 class ValidationResult(BaseModel):

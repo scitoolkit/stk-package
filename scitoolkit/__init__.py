@@ -13,7 +13,7 @@ Features:
 - Integration with Orchestral AI and other agent frameworks
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __author__ = "Alex Roman"
 
 # Placeholder imports for future toolkit categories

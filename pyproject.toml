@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scitoolkit"
-version = "0.5.0"
+version = "0.5.1"
 description = "A community repository for scientific agentic tools - discover, share, and use AI tools for science"
 readme = "README.md"
 requires-python = ">=3.12"
