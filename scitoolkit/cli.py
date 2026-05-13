@@ -179,6 +179,10 @@ class _SectionedGroup(click.Group):
             "Configuration",
             ["config", "setup", "project"],
         ),
+        (
+            "Maintenance",
+            ["reset"],
+        ),
     ]
 
     def format_commands(self, ctx, formatter):
@@ -232,7 +236,63 @@ def main():
 
     A platform for creating, publishing, and using AI tools for science.
     """
-    pass
+    # Phase 6 cutover messaging: surface a one-time-per-invocation heads-up
+    # on stderr when the 0.4.x install layout is detected on disk. Stderr
+    # (not stdout) keeps machine-readable outputs (``stk list --json``,
+    # MCP wire) clean while still surfacing the message to humans and to
+    # any caller piping stderr.
+    _warn_legacy_layout_if_present()
+
+
+def _warn_legacy_layout_if_present() -> None:
+    """If ``~/.scitoolkit/toolkits/`` exists with content, print a heads-up.
+
+    The 0.5.0 environments cutover moved installs from
+    ``~/.scitoolkit/toolkits/`` to ``~/.scitoolkit/cache/<name>/<version>/``.
+    Existing 0.4.x installs aren't auto-migrated (Alex authorized a clean
+    break). When we see the old dir, we tell the user once per
+    invocation and point at ``stk reset``.
+
+    Best-effort: silent on any error. Goes to stderr so JSON / MCP
+    consumers aren't affected. The heads-up is suppressed when
+    ``SCITOOLKIT_SUPPRESS_LEGACY_WARNING`` is set in the environment
+    (used by tests and by ``stk reset`` itself so the message doesn't
+    appear during the very command that cleans it up).
+    """
+    if os.environ.get("SCITOOLKIT_SUPPRESS_LEGACY_WARNING"):
+        return
+    try:
+        from .envs import legacy_toolkits_dir
+        legacy_dir = legacy_toolkits_dir()
+        if not legacy_dir.exists():
+            return
+        # "Non-empty" means at least one entry. We don't care what's
+        # inside — even an aborted install leaves directory bones we
+        # should clean up.
+        try:
+            has_content = any(True for _ in legacy_dir.iterdir())
+        except OSError:
+            return
+        if not has_content:
+            return
+        # Greppable log line, mirroring the brief's telemetry list.
+        try:
+            from .logging.logger import get_logger
+            get_logger().log_event(
+                event="legacy_layout_detected",
+                path=str(legacy_dir),
+            )
+        except Exception:
+            pass
+        click.echo(
+            "Heads up: 0.5.0 changed the install layout. Toolkits installed under\n"
+            f"{legacy_dir} are no longer used. Run `stk reset` to remove\n"
+            "them and reinstall the ones you need.",
+            err=True,
+        )
+    except Exception:
+        # Never fail a command because the heads-up couldn't be emitted.
+        pass
 
 
 def _stash_project_dir_override(ctx, value):
@@ -3644,6 +3704,206 @@ def uninstall(name, yes, no_, no_input):
             )
 
     console.print(f"\n[bold green]✓ Uninstalled {plural}[/bold green]")
+
+
+# ── stk reset ───────────────────────────────────────────────────────
+
+
+@main.command(name="reset")
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Show what would be deleted, then exit. Removes nothing.",
+)
+@click.option(
+    "--all", "all_mode", is_flag=True, default=False,
+    help=(
+        "Scorched-earth: remove cache/, toolkits/, downloads/, and "
+        "default-project/. Preserves config.json (login state) and logs/. "
+        "Preserves config/ unless --include-config is also passed."
+    ),
+)
+@click.option(
+    "--include-config", is_flag=True, default=False,
+    help=(
+        "Only with --all: also remove config/ (user-level toolkit "
+        "config). Use when starting completely fresh."
+    ),
+)
+@_interactive_options
+def reset(dry_run, all_mode, include_config, yes, no_, no_input):
+    """
+    Clean up SciToolkit state under ``~/.scitoolkit/``.
+
+    \b
+    Modes:
+      stk reset                        Cutover mode. Removes the legacy
+                                       0.4.x ``~/.scitoolkit/toolkits/``
+                                       dir only. Preserves cache/,
+                                       config/, default-project/,
+                                       serve.yaml, logs/, config.json.
+
+    \b
+      stk reset --all                  Scorched-earth. Removes cache/,
+                                       toolkits/, downloads/, and
+                                       default-project/. Preserves
+                                       config.json (login state) and
+                                       logs/. Preserves config/ unless
+                                       --include-config is also passed.
+                                       Requires extra confirmation.
+
+    \b
+      stk reset --all --include-config Full fresh-start. As --all, plus
+                                       removes config/ (user-level
+                                       toolkit config / secrets).
+
+    \b
+    Common flags:
+      --dry-run    List paths that would be deleted; remove nothing.
+      --yes / -y   Skip confirmation prompts. Required for CI.
+      --no         Refuse any confirmation (effectively a no-op).
+      --no-input   Use defaults for prompts (default-N for reset
+                   confirms, so reset becomes a no-op without --yes).
+
+    Use the existing ``stk uninstall <name>`` for per-toolkit removal.
+    ``stk reset`` is the bulk-clean / start-fresh hammer.
+    """
+    from .envs import legacy_toolkits_dir
+
+    if include_config and not all_mode:
+        raise click.UsageError(
+            "--include-config requires --all. Use `stk reset --all "
+            "--include-config` for a total fresh start."
+        )
+
+    mode = _resolve_prompt_mode(yes, no_, no_input)
+    user_root = scitoolkit_config_dir()
+    legacy_dir = legacy_toolkits_dir()
+
+    # Build the deletion list for the current mode. Order matters
+    # only for display; the actual rmtree is independent per entry.
+    targets: List[Tuple[str, Path]] = []
+
+    if all_mode:
+        # Scorched earth. Always preserves config.json and logs/.
+        targets.append(("cache/ (installed toolkit binaries)", user_root / "cache"))
+        targets.append(("toolkits/ (legacy 0.4.x layout)", legacy_dir))
+        targets.append(("downloads/ (cached downloads)", user_root / "downloads"))
+        targets.append(("default-project/ (implicit project)", user_root / "default-project"))
+        if include_config:
+            targets.append(("config/ (user-level toolkit config + secrets)", user_root / "config"))
+    else:
+        # Cutover mode — only the 0.4.x layout.
+        targets.append(("toolkits/ (legacy 0.4.x layout)", legacy_dir))
+
+    # Filter to paths that actually exist on disk.
+    existing = [(label, p) for label, p in targets if p.exists()]
+
+    if not existing:
+        if all_mode:
+            console.print("[dim]Nothing to reset — none of the targeted directories exist.[/dim]")
+        else:
+            console.print(
+                "[dim]Nothing to reset — no legacy 0.4.x install layout found.[/dim]"
+            )
+            console.print(
+                "Try [cyan]stk reset --all[/cyan] for a full fresh-start, "
+                "or [cyan]stk uninstall <name>[/cyan] for a single toolkit."
+            )
+        return
+
+    # Always list paths before asking — no hidden deletions, per the brief.
+    if dry_run:
+        console.print(f"[bold]Dry-run: the following would be removed[/bold]")
+    elif all_mode:
+        console.print(f"[bold red]This will remove the following:[/bold red]")
+    else:
+        console.print(f"[bold]This will remove the legacy 0.4.x layout:[/bold]")
+
+    for label, path in existing:
+        console.print(f"  [yellow]{label}[/yellow]")
+        console.print(f"    [dim]{path}[/dim]")
+
+    # Always-preserved paths (helpful reassurance).
+    if all_mode:
+        preserved = ["config.json (login state)", "logs/"]
+        if not include_config:
+            preserved.append("config/ (user-level toolkit config)")
+        console.print(f"\n[dim]Preserved: {', '.join(preserved)}[/dim]")
+
+    if dry_run:
+        console.print(f"\n[dim]Dry-run: nothing was deleted.[/dim]")
+        return
+
+    # Cutover-mode confirmation: default-N, consequential.
+    if not all_mode:
+        if not _confirm(
+            "\nProceed with cutover cleanup?",
+            default=False,
+            mode=mode,
+            consequential=True,
+        ):
+            console.print("[dim]Cancelled.[/dim]")
+            return
+    else:
+        # Scorched-earth requires extra confirmation on top of the
+        # standard one. Two prompts; both default-N; both consequential.
+        if not _confirm(
+            "\nProceed with full reset?",
+            default=False,
+            mode=mode,
+            consequential=True,
+        ):
+            console.print("[dim]Cancelled.[/dim]")
+            return
+        if not _confirm(
+            "Are you sure? This cannot be undone.",
+            default=False,
+            mode=mode,
+            consequential=True,
+        ):
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    # Suppress the heads-up message on subsequent stk invocations
+    # within this Python process — purely cosmetic for tests that
+    # invoke reset followed by another command.
+    os.environ["SCITOOLKIT_SUPPRESS_LEGACY_WARNING"] = "1"
+
+    errors = 0
+    for label, path in existing:
+        try:
+            shutil.rmtree(path)
+            console.print(f"[green]✓[/green] Removed {path}")
+        except OSError as e:
+            errors += 1
+            console.print(f"[red]✗[/red] Could not remove {path}: {e}")
+
+    if errors:
+        console.print(
+            f"\n[red]Done with {errors} error(s).[/red] Some paths could not be removed."
+        )
+        sys.exit(1)
+    if all_mode:
+        console.print(f"\n[bold green]✓ Reset complete.[/bold green]")
+        console.print(
+            "Reinstall toolkits with [cyan]stk install <name>[/cyan]."
+        )
+    else:
+        console.print(f"\n[bold green]✓ Legacy layout removed.[/bold green]")
+        console.print(
+            "Reinstall toolkits with [cyan]stk install <name>[/cyan] "
+            "to populate the new cache layout."
+        )
+
+
+def scitoolkit_config_dir() -> Path:
+    """Return the active ``~/.scitoolkit/`` root.
+
+    Reads ``scitoolkit.config.CONFIG_DIR`` at call time so test
+    monkeypatching is respected (HANDOFF.md gotcha #12).
+    """
+    from . import config as _config_mod
+    return _config_mod.CONFIG_DIR
 
 
 class _ServeGroup(click.Group):
