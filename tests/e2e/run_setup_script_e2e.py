@@ -78,7 +78,7 @@ def _start_download_server() -> str:
 
 
 def _setup_synthetic_install(toolkit_src: Path = TOOLKIT_SRC) -> Path:
-    """Materialize a fresh install tree under WORK_ROOT."""
+    """Materialize a fresh install in the 0.5.0 cache layout."""
     if WORK_ROOT.exists():
         shutil.rmtree(WORK_ROOT)
     WORK_ROOT.mkdir(parents=True)
@@ -86,16 +86,15 @@ def _setup_synthetic_install(toolkit_src: Path = TOOLKIT_SRC) -> Path:
     fake_home = WORK_ROOT
     (fake_home / ".scitoolkit").symlink_to(INSTALL_ROOT)
     INSTALL_ROOT.mkdir(parents=True)
-    (INSTALL_ROOT / "toolkits").mkdir()
-    (INSTALL_ROOT / "config").mkdir()
     (INSTALL_ROOT / "logs").mkdir()
-    (INSTALL_ROOT / "cache").mkdir()
+    (INSTALL_ROOT / "downloads").mkdir()
 
-    dest = INSTALL_ROOT / "toolkits" / TOOLKIT_NAME
+    version = "0.1.0"
+    dest = INSTALL_ROOT / "cache" / TOOLKIT_NAME / version
     shutil.copytree(toolkit_src, dest)
 
     meta = {
-        "name": TOOLKIT_NAME, "version": "0.1.0",
+        "name": TOOLKIT_NAME, "version": version,
         "environment": "venv",
         "python_path": sys.executable,
         "python_version": (
@@ -105,6 +104,12 @@ def _setup_synthetic_install(toolkit_src: Path = TOOLKIT_SRC) -> Path:
         "needs_setup": True,
     }
     (dest / ".stk_meta.json").write_text(json.dumps(meta, indent=2))
+    # Also write .install_meta.yaml so the cache walker recognizes the slot.
+    from scitoolkit.envs import write_install_meta as _wim
+    _wim(dest, name=TOOLKIT_NAME, version=version,
+         install_method="venv",
+         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+         extras={"python_path": sys.executable, "has_setup_script": True})
     return dest
 
 
@@ -207,14 +212,14 @@ def main() -> int:
     print("=" * 60)
     print("Step 4: orchestrator serves toolkit; tool sees injected state")
     print("=" * 60)
-    orch = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch = orchestrator.Orchestrator()
     orch.start()
 
     rt = orch._runtimes.get(TOOLKIT_NAME)
     if rt is None:
         print(f"!!! toolkit {TOOLKIT_NAME!r} did not load into orchestrator")
         return 8
-    print(f"  ✓ toolkit loaded: state={rt.state.name} pid={rt.proc.pid}")
+    print(f"  ✓ toolkit loaded: state={rt.state.name}")
 
     proxies = {p.get_name(): p for p in orch._proxy_tools}
     qualified = f"{TOOLKIT_NAME}__get_state"
@@ -267,6 +272,7 @@ def main() -> int:
     print("=" * 60)
     print("Step 6: validate cache invalidates after config change")
     print("=" * 60)
+    # Note: ``config/`` lives at the user-scope root under .scitoolkit/.
     cfg_path = INSTALL_ROOT / "config" / f"{TOOLKIT_NAME}.yaml"
     # Touch (modify mtime) — change to a clearly-newer timestamp.
     new_mtime = time.time() + 5
@@ -299,7 +305,7 @@ def main() -> int:
             return False
     """)
     fake_home_dest_setup = (
-        INSTALL_ROOT / "toolkits" / TOOLKIT_NAME / "setup.py"
+        INSTALL_ROOT / "cache" / TOOLKIT_NAME / "0.1.0" / "setup.py"
     )
     fake_home_dest_setup.write_text(bad_setup_py)
     # Bust the validate cache so the failure is observed.
@@ -324,7 +330,7 @@ def main() -> int:
     print("=" * 60)
     print("Step 8: orchestrator refuses to serve when validate(ctx) fails")
     print("=" * 60)
-    orch2 = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch2 = orchestrator.Orchestrator()
     try:
         orch2.start()
     except RuntimeError as e:

@@ -83,23 +83,32 @@ def main() -> int:
         print(f"!!! synthetic toolkit missing at {TOOLKIT_SRC}")
         return 1
 
-    # Set up so $HOME/.scitoolkit/ resolves to INSTALL_ROOT.
+    # 0.5.0 cache layout: $HOME/.scitoolkit/cache/<name>/<version>/.
     fake_home = WORK_ROOT
     if fake_home.exists():
         shutil.rmtree(fake_home)
     fake_home.mkdir(parents=True)
     (fake_home / ".scitoolkit").symlink_to(INSTALL_ROOT)
     INSTALL_ROOT.mkdir(parents=True)
-    (INSTALL_ROOT / "toolkits").mkdir()
-    dest = INSTALL_ROOT / "toolkits" / TOOLKIT_NAME
+    version = "0.1.0"
+    cache_root = INSTALL_ROOT / "cache"
+    dest = cache_root / TOOLKIT_NAME / version
     shutil.copytree(TOOLKIT_SRC, dest)
     meta = {
-        "name": TOOLKIT_NAME, "version": "0.1.0",
+        "name": TOOLKIT_NAME, "version": version,
         "environment": "venv",
         "python_path": sys.executable,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
     (dest / ".stk_meta.json").write_text(json.dumps(meta, indent=2))
+    # Also drop the canonical .install_meta.yaml so the cache walker
+    # picks the slot up; the .stk_meta.json carry-along stays for the
+    # serve / setup runner.
+    from scitoolkit.envs import write_install_meta as _wim
+    _wim(dest, name=TOOLKIT_NAME, version=version,
+         install_method="venv",
+         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+         extras={"python_path": sys.executable})
 
     # Patch HOME so the CLI's CONFIG_DIR resolves to our isolated dir.
     os.environ["HOME"] = str(fake_home)
@@ -155,7 +164,7 @@ def main() -> int:
     print("=" * 60)
     print("Step 2: orchestrator should skip toolkit on missing required")
     print("=" * 60)
-    orch = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch = orchestrator.Orchestrator()  # cache-walker discovery
     try:
         orch.start()
     except RuntimeError as e:
@@ -189,14 +198,14 @@ def main() -> int:
     print("=" * 60)
     print("Step 4: orchestrator serves; tool sees injected state")
     print("=" * 60)
-    orch = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch = orchestrator.Orchestrator()  # cache-walker discovery
     orch.start()
 
     rt = orch._runtimes.get(TOOLKIT_NAME)
     if rt is None:
         print(f"!!! toolkit {TOOLKIT_NAME!r} did not load")
         return 7
-    print(f"  state: {rt.state.name} (pid={rt.proc.pid})")
+    print(f"  state: {rt.state.name}")
 
     proxies = {p.get_name(): p for p in orch._proxy_tools}
     qualified = f"{TOOLKIT_NAME}__get_config"

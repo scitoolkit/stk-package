@@ -1149,11 +1149,12 @@ def _resolve_toolkit_for_config(toolkit_name: str):
     ``config:`` block. Errors out (sys.exit 1) if the toolkit isn't
     installed.
     """
-    from .config import TOOLKITS_DIR
     from .setup import parse_config_block
+    from .setup.runner import _resolve_toolkit_dir
 
-    toolkit_dir = TOOLKITS_DIR / toolkit_name
-    if not toolkit_dir.exists():
+    try:
+        toolkit_dir = _resolve_toolkit_dir(toolkit_name, None)
+    except RuntimeError:
         console.print(
             f"[red]✗ Toolkit '{toolkit_name}' is not installed.[/red]"
         )
@@ -1434,21 +1435,21 @@ def setup(toolkit_name, reset, check, yes, no_, no_input):
         scitoolkit setup aster --reset      # clear config, re-run setup
         scitoolkit setup aster --check      # run validate(ctx) only
     """
-    from .config import TOOLKITS_DIR
     from .setup import (
         run_setup_script, validate_setup_script,
         run_install_setup, parse_config_block,
         delete_config, config_path,
     )
-    from .setup.runner import SetupResult
+    from .setup.runner import SetupResult, _resolve_toolkit_dir
 
     if reset and check:
         raise click.UsageError("--reset and --check are mutually exclusive.")
 
     mode = _resolve_prompt_mode(yes, no_, no_input)
 
-    toolkit_dir = TOOLKITS_DIR / toolkit_name
-    if not toolkit_dir.exists():
+    try:
+        toolkit_dir = _resolve_toolkit_dir(toolkit_name, None)
+    except RuntimeError:
         console.print(
             f"[red]✗ Toolkit '{toolkit_name}' is not installed.[/red]"
         )
@@ -2240,11 +2241,28 @@ def install(name, version, no_skills, yes, no_, no_input):
     \b
     Examples:
         scitoolkit install aster                   # latest
-        scitoolkit install aster --version 1.2.0   # pin a version
+        scitoolkit install aster@1.2.0             # pin a version via @ syntax
+        scitoolkit install aster --version 1.2.0   # pin a version via flag
         scitoolkit install aster -v 1.2.0          # short alias
         scitoolkit install aster --no-skills       # don't touch ~/.claude/skills/
     """
     mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    # Parse name@version syntax. Both `aster@1.2.0` and `aster --version 1.2.0`
+    # work; conflict (both forms specifying versions) raises.
+    if "@" in name:
+        bare_name, _, suffix_version = name.partition("@")
+        if not bare_name or not suffix_version:
+            raise click.UsageError(
+                f"Bad name@version syntax: {name!r} (need both sides of @)."
+            )
+        if version and version != suffix_version:
+            raise click.UsageError(
+                f"Conflicting versions: '@{suffix_version}' vs --version {version}."
+            )
+        name = bare_name
+        if not version:
+            version = suffix_version
 
     console.print(f"\n[bold blue]Installing toolkit: {name}[/bold blue]\n")
 
@@ -2312,36 +2330,21 @@ def install(name, version, no_skills, yes, no_, no_input):
         console.print(f"[red]✗ Network error: {e}[/red]")
         sys.exit(1)
 
-    # Step 2: Check if already installed
-    from .config import TOOLKITS_DIR
-    toolkit_dir = TOOLKITS_DIR / name
+    # Step 2: Check if this specific (name, version) is already installed.
+    #
+    # Phase 2 cache layout: each (name, version) lives in its own slot at
+    # ``~/.scitoolkit/cache/<name>/<version>/``. Different versions of the
+    # same toolkit coexist side-by-side. We only collide with this version's
+    # own slot here; other versions are left alone.
+    from .envs import cache_dir as _envs_cache_dir
+    toolkit_dir = _envs_cache_dir(name, version)
 
     if toolkit_dir.exists():
-        # Check installed version
-        meta_file = toolkit_dir / '.stk_meta.json'
-        if meta_file.exists():
-            try:
-                with open(meta_file) as f:
-                    installed_meta = json.load(f)
-                    installed_version = installed_meta.get('version')
-
-                if installed_version == version:
-                    # Reinstall is benign — same version, just re-fetched.
-                    console.print(f"[yellow]{name} v{version} is already installed.[/yellow]")
-                    if not _confirm("Reinstall?", default=True, mode=mode):
-                        sys.exit(0)
-                else:
-                    # Version replacement is consequential — destroys the old install.
-                    console.print(f"[yellow]{name} v{installed_version} is already installed.[/yellow]")
-                    console.print(f"Installing v{version} will replace it.")
-                    if not _confirm(
-                        "Continue?", default=False, mode=mode, consequential=True,
-                    ):
-                        sys.exit(0)
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        # Remove existing installation
+        # Reinstall of an existing slot is benign — same version, re-fetched.
+        console.print(f"[yellow]{name} v{version} is already installed.[/yellow]")
+        if not _confirm("Reinstall?", default=True, mode=mode):
+            sys.exit(0)
+        # Remove the existing slot so the extract path is clean.
         shutil.rmtree(toolkit_dir)
 
     # Step 3: Download tarball. The progress bar self-announces ("Downloading
@@ -2536,8 +2539,62 @@ def install(name, version, no_skills, yes, no_, no_input):
     elif env_type == 'conda':
         meta['env_name'] = env_name
 
-    meta_file = toolkit_dir / '.stk_meta.json'
-    meta_file.write_text(json.dumps(meta, indent=2))
+    # Write the legacy ``.stk_meta.json`` (consumed by serve / setup runner)
+    # AND the new ``.install_meta.yaml`` (canonical, schema-versioned).
+    # The legacy file stays until later phases migrate serve / runner.
+    from .envs import (
+        write_legacy_meta as _write_legacy_meta,
+        write_install_meta as _write_install_meta,
+        compute_and_write_disk_size as _compute_and_write_disk_size,
+    )
+    _write_legacy_meta(toolkit_dir, meta)
+
+    install_extras: dict = {}
+    if env_type == 'venv':
+        install_extras["python_path"] = str(python_path)
+    elif env_type == 'conda':
+        install_extras["env_name"] = env_name
+    install_extras["tools_count"] = tools_count
+    install_extras["has_skills"] = len(skill_files) > 0
+    install_extras["skills_count"] = len(skill_files)
+    install_extras["has_setup_script"] = has_setup_script
+    _write_install_meta(
+        toolkit_dir,
+        name=name,
+        version=version,
+        install_method=env_type or "venv",
+        python_version=python_version or "?",
+        extras=install_extras,
+    )
+
+    # Best-effort: walk the slot, write ``.disk_size`` for fast ``stk list``.
+    # If the walk blows the budget, ``compute_and_write_disk_size`` returns
+    # None and the file is skipped — ``stk list`` shows "—" instead of
+    # slowing down on demand.
+    try:
+        _compute_and_write_disk_size(toolkit_dir)
+    except Exception:
+        pass
+
+    # Pin into the default-project manifest. Real per-project discovery
+    # arrives in Phase 3; until then ``stk install`` always pins into
+    # the implicit global project. The cache slot itself is project-
+    # agnostic; only the pin is per-project.
+    try:
+        from .envs import (
+            default_project_root as _default_project_root,
+            project_manifest_path as _project_manifest_path,
+            add_pin as _add_pin,
+        )
+        manifest_path = _project_manifest_path(_default_project_root())
+        _add_pin(manifest_path, name, version)
+    except Exception as e:
+        # Manifest pinning is best-effort during Phase 2; serve will
+        # fall back to walking the cache if no manifest is found.
+        # Phase 3 makes the manifest authoritative.
+        console.print(
+            f"[dim]Note: could not pin to default-project manifest: {e}[/dim]"
+        )
 
     # Step 9: Success message
     console.print(f"\n[bold green]✓ Successfully installed {name} v{version}[/bold green]\n")
@@ -2655,10 +2712,12 @@ def install(name, version, no_skills, yes, no_, no_input):
     expected = toolkit_config.get('expected_toolkits') or []
     expected = [e for e in expected if isinstance(e, str)]
     if expected:
-        from .config import TOOLKITS_DIR
+        # Companion installs: "installed" now means "has any version in
+        # the cache" — the multi-version model means a companion at any
+        # pin still counts.
+        from .envs import list_versions as _list_versions
         not_installed = [
-            e for e in expected
-            if not (TOOLKITS_DIR / e).exists()
+            e for e in expected if not _list_versions(e)
         ]
         if not_installed:
             console.print(
@@ -2720,82 +2779,124 @@ def list_cmd():
     """
     List all installed toolkits.
 
-    Reads .stk_meta.json from each installed toolkit and displays a summary
-    table. Does not activate any environments — purely metadata-driven.
+    Walks ``~/.scitoolkit/cache/<name>/<version>/`` and groups by name.
+    Multi-version installs are shown side-by-side. Per entry:
+
+    \b
+    - last_used: human-friendly delta from the per-slot ``.last_used``
+      file (touched on every ``stk serve`` spawn).
+    - disk_size: bytes from the per-slot ``.disk_size`` file (computed
+      once at install time). "—" if missing.
 
     Example:
         scitoolkit list
     """
-    from .config import TOOLKITS_DIR
+    from .envs import walk_cache
 
-    if not TOOLKITS_DIR.exists():
+    entries = walk_cache()
+
+    if not entries:
         console.print("[dim]No toolkits installed.[/dim]")
         console.print("\nInstall one with: [cyan]scitoolkit install <name>[/cyan]")
         return
 
-    # Discover installed toolkits by their .stk_meta.json files.
-    entries: list[tuple[Path, dict]] = []
-    broken = []
-    for toolkit_dir in sorted(TOOLKITS_DIR.iterdir()):
-        if not toolkit_dir.is_dir():
-            continue
-        meta_file = toolkit_dir / '.stk_meta.json'
-        if not meta_file.exists():
-            broken.append(toolkit_dir.name)
-            continue
-        try:
-            entries.append((toolkit_dir, json.loads(meta_file.read_text())))
-        except (json.JSONDecodeError, IOError):
-            broken.append(toolkit_dir.name)
-
-    if not entries and not broken:
-        console.print("[dim]No toolkits installed.[/dim]")
-        console.print("\nInstall one with: [cyan]scitoolkit install <name>[/cyan]")
-        return
-
-    home = str(Path.home())
+    # Group entries by toolkit name; within a name, sort by version desc.
+    from .versioning import parse_version
+    grouped: dict[str, list] = {}
+    for e in entries:
+        grouped.setdefault(e.name, []).append(e)
+    for k in grouped:
+        grouped[k].sort(
+            key=lambda e: parse_version(e.version) or (0, 0, 0),
+            reverse=True,
+        )
 
     table = Table(title="Installed Toolkits")
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Version", style="white")
     table.add_column("Environment", style="white")
+    table.add_column("Last used", style="white")
+    table.add_column("Disk size", style="white", justify="right")
     table.add_column("Tools", justify="right", style="dark_orange")
     table.add_column("Skills", justify="right", style="dark_orange")
-    table.add_column("Path", style="dim", overflow="fold")
 
-    for toolkit_dir, meta in entries:
-        env_type = meta.get('environment', 'unknown')
-        py_ver = meta.get('python_version', '?')
-        env_label = f"{env_type} (py{py_ver})"
+    for name in sorted(grouped):
+        first = True
+        for entry in grouped[name]:
+            # Prefer install_meta; fall back to legacy_meta when fields
+            # haven't been migrated yet.
+            meta = entry.install_meta or entry.legacy_meta
+            env_type = meta.get('install_method') or meta.get('environment', 'unknown')
+            py_ver = meta.get('python_version', '?')
+            env_label = f"{env_type} (py{py_ver})"
 
-        # Show ~/-relative path so the column doesn't blow out.
-        path_str = str(toolkit_dir)
-        if path_str.startswith(home):
-            path_str = "~" + path_str[len(home):]
+            name_cell = name if first else ""
+            first = False
 
-        name_cell = meta.get('name', '?')
-        if meta.get('needs_setup'):
-            name_cell += " [yellow](setup needed)[/yellow]"
+            tools_count = meta.get('tools_count', 0)
+            skills_count = meta.get('skills_count', 0)
+            if meta.get('has_setup_script'):
+                # Mirror the prior surface: setup-script toolkits get a
+                # subtle indicator until validate(ctx) passes.
+                pass  # serve will skip if validate fails; not flagged here
 
-        table.add_row(
-            name_cell,
-            meta.get('version', '?'),
-            env_label,
-            str(meta.get('tools_count', 0)),
-            str(meta.get('skills_count', 0)),
-            path_str,
-        )
+            table.add_row(
+                name_cell,
+                entry.version,
+                env_label,
+                _format_last_used(entry.last_used_iso),
+                _format_disk_size(entry.disk_size_bytes),
+                str(tools_count),
+                str(skills_count),
+            )
 
     console.print(table)
 
-    if broken:
-        console.print(
-            f"\n[yellow]{len(broken)} toolkit director"
-            f"{'ies' if len(broken) != 1 else 'y'} missing or unreadable .stk_meta.json:[/yellow]"
-        )
-        for name in broken:
-            console.print(f"  [dim]•[/dim] {name}")
-        console.print("[dim]These were likely installed by an older CLI; reinstall to fix.[/dim]")
+
+def _format_last_used(iso_stamp: Optional[str]) -> str:
+    """Render an ISO-8601 timestamp as a human-friendly 'X ago'.
+
+    Returns "never" for missing stamps, "just now" / "X seconds ago" /
+    "X minutes ago" / "X hours ago" / "X days ago" / "X weeks ago"
+    otherwise. Never raises — formatting issues fall back to the raw
+    stamp.
+    """
+    if not iso_stamp:
+        return "never"
+    try:
+        ts = datetime.fromisoformat(iso_stamp)
+    except (TypeError, ValueError):
+        return iso_stamp
+    delta = datetime.now() - ts
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "just now"  # clock skew
+    if secs < 5:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    days = secs // 86400
+    if days < 14:
+        return f"{days}d ago"
+    return f"{days // 7}w ago"
+
+
+def _format_disk_size(size_bytes: Optional[int]) -> str:
+    """Render a byte count as a human-friendly string. ``None`` → '—'."""
+    if size_bytes is None:
+        return "—"
+    n = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
 
 
 @main.command()
@@ -2805,86 +2906,144 @@ def uninstall(name, yes, no_, no_input):
     """
     Uninstall a toolkit.
 
-    Removes the toolkit directory and any associated conda environment.
-    Venv environments live inside the toolkit directory, so they're cleaned
-    up automatically.
+    \b
+    Two forms:
+      stk uninstall aster              — removes ALL installed versions
+      stk uninstall aster@1.2.0        — removes one version slot only
 
-    Example:
+    Also removes the corresponding pin from the active project's
+    manifest (Phase 2: default-project; Phase 3 wires real per-project).
+
+    Conda environments are torn down before the cache slot is removed
+    (so a failure here doesn't leave orphan conda envs behind).
+
+    \b
+    Examples:
         scitoolkit uninstall aster
+        scitoolkit uninstall aster@1.2.0
         scitoolkit uninstall aster --yes
     """
-    from .config import TOOLKITS_DIR
+    from .envs import (
+        walk_cache as _walk_cache,
+        list_versions as _list_versions,
+        find_slot as _find_slot,
+        default_project_root as _default_project_root,
+        project_manifest_path as _project_manifest_path,
+        remove_pin as _remove_pin,
+    )
 
     mode = _resolve_prompt_mode(yes, no_, no_input)
 
-    toolkit_dir = TOOLKITS_DIR / name
-    if not toolkit_dir.exists():
+    # Parse name@version: if @ is present, target one slot; otherwise all versions.
+    target_version: Optional[str] = None
+    if "@" in name:
+        bare, _, ver = name.partition("@")
+        if not bare or not ver:
+            raise click.UsageError(
+                f"Bad name@version syntax: {name!r} (need both sides of @)."
+            )
+        name = bare
+        target_version = ver
+
+    versions = _list_versions(name)
+    if not versions:
         console.print(f"[red]✗ Toolkit '{name}' is not installed.[/red]")
         console.print("\nList installed toolkits: [cyan]scitoolkit list[/cyan]")
         sys.exit(1)
 
-    # Read metadata if available so we know whether there's a conda env to remove
-    meta_file = toolkit_dir / '.stk_meta.json'
-    meta = {}
-    if meta_file.exists():
-        try:
-            meta = json.loads(meta_file.read_text())
-        except (json.JSONDecodeError, IOError):
+    if target_version is not None:
+        slot = _find_slot(name, target_version)
+        if slot is None:
             console.print(
-                "[yellow]Could not read .stk_meta.json. "
-                "Proceeding with directory removal only.[/yellow]"
+                f"[red]✗ {name} v{target_version} is not installed.[/red]"
             )
+            console.print(
+                f"Installed versions of {name}: {', '.join(sorted(versions))}"
+            )
+            sys.exit(1)
+        targets = [slot]
+        plural = f"{name} v{target_version}"
+    else:
+        targets = [_find_slot(name, v) for v in versions]
+        targets = [t for t in targets if t is not None]
+        if len(targets) == 1:
+            plural = f"{name} v{targets[0].version}"
+        else:
+            plural = f"{name} ({len(targets)} versions: {', '.join(t.version for t in targets)})"
 
-    env_type = meta.get('environment')
-    env_name = meta.get('env_name')
-    version = meta.get('version', '?')
+    console.print(f"\n[bold]Uninstalling {plural}[/bold]")
+    for slot in targets:
+        console.print(f"  Directory: [dim]{slot.path}[/dim]")
+        meta = slot.install_meta or slot.legacy_meta
+        env_type = meta.get('install_method') or meta.get('environment')
+        env_name = meta.get('env_name')
+        if env_type == 'conda' and env_name:
+            console.print(f"  Conda env: [dim]{env_name}[/dim]")
 
-    # Confirm
-    console.print(f"\n[bold]Uninstalling {name} v{version}[/bold]")
-    console.print(f"  Directory: [dim]{toolkit_dir}[/dim]")
-    if env_type == 'conda' and env_name:
-        console.print(f"  Conda env: [dim]{env_name}[/dim]")
-
-    # Uninstall is consequential — deletes the toolkit dir and possibly a
-    # conda env. In skip mode require explicit --yes to proceed.
+    # Uninstall is consequential.
     if not _confirm(
         "\nProceed?", default=False, mode=mode, consequential=True,
     ):
         console.print("[dim]Cancelled.[/dim]")
         sys.exit(0)
 
-    # Remove conda env first (best effort) so a failure here doesn't leave us
-    # with an orphan env after the directory is gone.
-    if env_type == 'conda' and env_name:
-        with console.status(f"[bold blue]Removing conda environment '{env_name}'..."):
-            cleanup_conda_environment(env_name)
-        console.print(f"[green]✓ Removed conda environment '{env_name}'[/green]")
+    for slot in targets:
+        meta = slot.install_meta or slot.legacy_meta
+        env_type = meta.get('install_method') or meta.get('environment')
+        env_name = meta.get('env_name')
+        # Remove conda env first.
+        if env_type == 'conda' and env_name:
+            with console.status(f"[bold blue]Removing conda environment '{env_name}'..."):
+                cleanup_conda_environment(env_name)
+            console.print(f"[green]✓ Removed conda environment '{env_name}'[/green]")
+        try:
+            shutil.rmtree(slot.path)
+            console.print(f"[green]✓ Removed {slot.path}[/green]")
+        except OSError as e:
+            console.print(f"[red]✗ Could not remove {slot.path}: {e}[/red]")
+            sys.exit(1)
 
-    # Remove toolkit directory (covers venv inside it too)
-    try:
-        shutil.rmtree(toolkit_dir)
-        console.print(f"[green]✓ Removed {toolkit_dir}[/green]")
-    except OSError as e:
-        console.print(f"[red]✗ Could not remove directory: {e}[/red]")
-        sys.exit(1)
+    # If we removed all versions, prune the empty parent dir too.
+    from .envs import cache_root as _cache_root
+    name_dir = _cache_root() / name
+    if name_dir.exists() and not any(name_dir.iterdir()):
+        try:
+            name_dir.rmdir()
+        except OSError:
+            pass
 
-    # Best-effort cleanup of surfaced skills under ~/.claude/skills/.
-    # Only removes directories carrying the scitoolkit-managed marker, so
-    # user-placed skills with the same name prefix are untouched.
+    # Update the default-project manifest.
+    #
+    # - ``uninstall <name>``: remove the pin entirely.
+    # - ``uninstall <name>@<ver>``: if any other version remains, leave
+    #   the pin alone (still valid, even if we just unpinned one slot).
+    #   If no versions remain, remove the pin.
     try:
-        from .skills import uninstall_skills_for_toolkit
-        removed_skills = uninstall_skills_for_toolkit(name)
-        if removed_skills:
-            console.print(
-                f"[green]✓[/green] Removed {len(removed_skills)} skill"
-                f"{'s' if len(removed_skills) != 1 else ''} from ~/.claude/skills/"
-            )
+        manifest_path = _project_manifest_path(_default_project_root())
+        remaining = _list_versions(name)
+        if not remaining:
+            _remove_pin(manifest_path, name)
     except Exception as e:
         console.print(
-            f"[yellow]Could not clean up ~/.claude/skills entries: {e}[/yellow]"
+            f"[dim]Note: could not update default-project manifest: {e}[/dim]"
         )
 
-    console.print(f"\n[bold green]✓ Uninstalled {name}[/bold green]")
+    # Skills cleanup — only when ALL versions are gone.
+    if not _list_versions(name):
+        try:
+            from .skills import uninstall_skills_for_toolkit
+            removed_skills = uninstall_skills_for_toolkit(name)
+            if removed_skills:
+                console.print(
+                    f"[green]✓[/green] Removed {len(removed_skills)} skill"
+                    f"{'s' if len(removed_skills) != 1 else ''} from ~/.claude/skills/"
+                )
+        except Exception as e:
+            console.print(
+                f"[yellow]Could not clean up ~/.claude/skills entries: {e}[/yellow]"
+            )
+
+    console.print(f"\n[bold green]✓ Uninstalled {plural}[/bold green]")
 
 
 class _ServeGroup(click.Group):

@@ -912,16 +912,91 @@ def _resolve_python_exe(meta: Dict[str, Any], toolkit_name: str) -> str:
     )
 
 
+def _resolve_toolkit_dir(
+    toolkit_name: str,
+    toolkits_dir: Optional[Path],
+) -> Path:
+    """Resolve where a toolkit's installed binaries live.
+
+    Three resolution modes:
+
+    - ``toolkits_dir`` explicitly passed → use that (test-injection
+      path; matches the 0.4.x flat layout used in test fixtures).
+    - ``toolkits_dir`` is None → resolve via the 0.5.0 cache layout.
+      The active version is picked from the default-project manifest
+      pin if there is one; otherwise the only-installed-version (if
+      there's exactly one) or the highest version when multiple.
+
+    Raises ``RuntimeError`` if the toolkit isn't installed anywhere.
+    """
+    if toolkits_dir is not None:
+        legacy = toolkits_dir / toolkit_name
+        if not legacy.exists():
+            raise RuntimeError(
+                f"toolkit {toolkit_name!r} is not installed at {legacy}"
+            )
+        return legacy
+
+    # 0.5.0 cache walk.
+    from ..envs import (
+        list_versions, find_slot, default_project_root,
+        project_manifest_path, get_pin,
+    )
+    from ..versioning import parse_version
+
+    versions = list_versions(toolkit_name)
+    if not versions:
+        raise RuntimeError(
+            f"toolkit {toolkit_name!r} is not installed (no slot in "
+            "~/.scitoolkit/cache/)"
+        )
+
+    # Prefer the pin from the default-project manifest (Phase 3 wires
+    # real per-project discovery).
+    try:
+        manifest_path = project_manifest_path(default_project_root())
+        pin = get_pin(manifest_path, toolkit_name)
+    except Exception:
+        pin = None
+
+    if pin is not None and pin.version in versions:
+        chosen_version = pin.version
+    elif len(versions) == 1:
+        chosen_version = versions[0]
+    else:
+        # No pin, multiple — pick highest.
+        chosen_version = sorted(
+            versions,
+            key=lambda v: parse_version(v) or (0, 0, 0),
+            reverse=True,
+        )[0]
+
+    slot = find_slot(toolkit_name, chosen_version)
+    if slot is None:
+        raise RuntimeError(
+            f"toolkit {toolkit_name!r} v{chosen_version} resolution "
+            "failed (cache walk inconsistency)"
+        )
+    return slot.path
+
+
 def _scitoolkit_dirs(toolkit_name: str) -> Tuple[Path, Path, Path]:
     """Return (data_dir, cache_dir, log_dir) for a toolkit.
 
-    Resolves at call time from ``~/.scitoolkit/`` (using the same
-    HOME-aware logic the rest of the package uses).
+    Resolves at call time from ``~/.scitoolkit/``.
+
+    NB (0.5.0): the per-toolkit downloads cache used to live at
+    ``~/.scitoolkit/cache/<toolkit>/`` but that path now belongs to
+    the toolkit-binaries cache (``cache/<name>/<version>/``). The
+    downloads cache moved to ``~/.scitoolkit/downloads/<toolkit>/``
+    to avoid the namespacing collision. The setup ``_setup_validate.json``
+    file is fine where it is (top-of-cache underscore-prefixed names
+    are filtered out by the cache walker).
     """
     home = Path.home()
     base = home / ".scitoolkit"
     data_dir = base / "data" / toolkit_name
-    cache_dir = base / "cache" / toolkit_name
+    cache_dir = base / "downloads" / toolkit_name
     log_dir = base / "logs"
     return data_dir, cache_dir, log_dir
 
@@ -947,13 +1022,7 @@ def run_setup_script(
         extra_handlers: additional RPC method handlers (Day 2/3 wires
             in prompts, set_config, download).
     """
-    if toolkits_dir is None:
-        toolkits_dir = Path.home() / ".scitoolkit" / "toolkits"
-    toolkit_dir = toolkits_dir / toolkit_name
-    if not toolkit_dir.exists():
-        raise RuntimeError(
-            f"toolkit {toolkit_name!r} is not installed at {toolkit_dir}"
-        )
+    toolkit_dir = _resolve_toolkit_dir(toolkit_name, toolkits_dir)
 
     meta = _read_toolkit_meta(toolkit_dir)
     python_exe = _resolve_python_exe(meta, toolkit_name)
@@ -1012,13 +1081,7 @@ def validate_setup_script_cached(
         ValidateCache, default_cache_path, _mtime_or_none,
     )
 
-    if toolkits_dir is None:
-        toolkits_dir = Path.home() / ".scitoolkit" / "toolkits"
-    toolkit_dir = toolkits_dir / toolkit_name
-    if not toolkit_dir.exists():
-        raise RuntimeError(
-            f"toolkit {toolkit_name!r} is not installed at {toolkit_dir}"
-        )
+    toolkit_dir = _resolve_toolkit_dir(toolkit_name, toolkits_dir)
 
     setup_py = toolkit_dir / "setup.py"
     cfg_path = _config_path_for(toolkit_name)
@@ -1075,13 +1138,7 @@ def validate_setup_script(
     serve doesn't pay the subprocess-spawn cost when nothing has
     changed since the last validate.
     """
-    if toolkits_dir is None:
-        toolkits_dir = Path.home() / ".scitoolkit" / "toolkits"
-    toolkit_dir = toolkits_dir / toolkit_name
-    if not toolkit_dir.exists():
-        raise RuntimeError(
-            f"toolkit {toolkit_name!r} is not installed at {toolkit_dir}"
-        )
+    toolkit_dir = _resolve_toolkit_dir(toolkit_name, toolkits_dir)
 
     meta = _read_toolkit_meta(toolkit_dir)
     python_exe = _resolve_python_exe(meta, toolkit_name)

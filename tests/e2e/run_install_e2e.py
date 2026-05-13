@@ -41,7 +41,13 @@ TOOLKIT_NAME = "stk-e2e-test"
 TOOLKIT_VERSION = "0.1.0"
 
 WORK_ROOT = Path(tempfile.gettempdir()) / "stk-e2e"
-INSTALL_ROOT = WORK_ROOT / "install-root"
+# In 0.5.0, the install lands at ``<FAKE_HOME>/cache/<name>/<version>/``.
+# We point CONFIG_DIR at FAKE_HOME so the entire substrate (cache,
+# default-project manifest, etc.) lands under our tmp tree.
+FAKE_HOME = WORK_ROOT / "fake-home" / ".scitoolkit"
+# Legacy expected slot for serve e2e back-compat — kept as a symlink
+# target so run_serve_e2e.py can point its HOME at WORK_ROOT/fake-home/.
+INSTALL_ROOT = FAKE_HOME / "cache"
 TARBALL_PATH = WORK_ROOT / "test-toolkit.tar.gz"
 
 
@@ -102,9 +108,10 @@ def main() -> int:
 
     _build_tarball()
 
-    if INSTALL_ROOT.exists():
-        shutil.rmtree(INSTALL_ROOT)
-    INSTALL_ROOT.mkdir(parents=True)
+    # Clear and recreate the fake home.
+    if FAKE_HOME.exists():
+        shutil.rmtree(FAKE_HOME)
+    FAKE_HOME.mkdir(parents=True)
 
     # Redirect the skills-surface destination to a tmp dir so we don't
     # write synthetic-toolkit skills into the developer's real
@@ -115,8 +122,7 @@ def main() -> int:
 
     from scitoolkit import skills as skills_mod
 
-    with mock.patch.object(config, "TOOLKITS_DIR", INSTALL_ROOT), \
-         mock.patch.object(cli, "TOOLKITS_DIR", INSTALL_ROOT, create=True), \
+    with mock.patch.object(config, "CONFIG_DIR", FAKE_HOME), \
          mock.patch.object(skills_mod, "CLAUDE_SKILLS_DIR", fake_claude_skills), \
          mock.patch.object(requests, "get", side_effect=fake_get):
         runner = CliRunner()
@@ -130,12 +136,38 @@ def main() -> int:
     print("--- output ---")
     print(result.output)
 
-    meta_file = INSTALL_ROOT / TOOLKIT_NAME / ".stk_meta.json"
-    if not meta_file.exists():
-        print("!!! no .stk_meta.json was written")
+    # 0.5.0 install lands at cache/<name>/<version>/. We discover the
+    # version dir by walking the name dir.
+    name_dir = FAKE_HOME / "cache" / TOOLKIT_NAME
+    if not name_dir.exists():
+        print(f"!!! no install dir written at {name_dir}")
         return 1
-    print("--- written .stk_meta.json ---")
+    version_dirs = [p for p in name_dir.iterdir() if p.is_dir()]
+    if not version_dirs:
+        print(f"!!! no version slot under {name_dir}")
+        return 1
+    slot = version_dirs[0]
+    meta_file = slot / ".stk_meta.json"
+    install_meta = slot / ".install_meta.yaml"
+    if not meta_file.exists():
+        print(f"!!! no .stk_meta.json was written at {slot}")
+        return 1
+    if not install_meta.exists():
+        print(f"!!! no .install_meta.yaml was written at {slot}")
+        return 1
+
+    print(f"--- written cache slot: {slot} ---")
     print(json.dumps(json.loads(meta_file.read_text()), indent=2))
+    print("--- .install_meta.yaml ---")
+    print(install_meta.read_text())
+
+    # Verify the default-project manifest got a pin.
+    manifest_path = FAKE_HOME / "default-project" / "manifest.yaml"
+    if not manifest_path.exists():
+        print(f"!!! no default-project manifest at {manifest_path}")
+        return 1
+    print("--- default-project manifest ---")
+    print(manifest_path.read_text())
 
     if result.exit_code != 0:
         print(f"!!! install exited non-zero ({result.exit_code})")

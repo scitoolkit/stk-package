@@ -36,13 +36,22 @@ from pathlib import Path
 
 
 WORK_ROOT = Path(tempfile.gettempdir()) / "stk-e2e"
-INSTALL_ROOT = WORK_ROOT / "install-root"
+# Hardened to the 0.5.0 cache layout: cache/<name>/<version>/.
+FAKE_HOME_FROM_INSTALL = WORK_ROOT / "fake-home"
+INSTALL_CACHE = FAKE_HOME_FROM_INSTALL / ".scitoolkit" / "cache"
 TOOLKIT_NAME = "stk-e2e-test"
 
 
 def main() -> int:
-    if not (INSTALL_ROOT / TOOLKIT_NAME / ".stk_meta.json").exists():
-        print(f"!!! synthetic toolkit not installed at {INSTALL_ROOT / TOOLKIT_NAME}")
+    # Find any installed version under the cache.
+    name_dir = INSTALL_CACHE / TOOLKIT_NAME
+    if not name_dir.exists():
+        print(f"!!! synthetic toolkit cache dir missing at {name_dir}")
+        print("    Run run_install_e2e.py first.")
+        return 1
+    version_dirs = [p for p in name_dir.iterdir() if p.is_dir()]
+    if not version_dirs:
+        print(f"!!! no version slot under {name_dir}")
         print("    Run run_install_e2e.py first.")
         return 1
 
@@ -54,16 +63,13 @@ def main() -> int:
         )
         return 1
 
-    # Redirect ~/.scitoolkit so we use the synthetic toolkit, not the real
-    # user's installed toolkits. Symlink the install root in.
-    fake_home = WORK_ROOT / "serve-home"
-    if fake_home.exists():
-        shutil.rmtree(fake_home)
-    (fake_home / ".scitoolkit").mkdir(parents=True)
-    (fake_home / ".scitoolkit" / "toolkits").symlink_to(INSTALL_ROOT)
+    # Serve will discover the toolkit in the cache, but it also needs the
+    # default-project manifest's pin to resolve which version. The install
+    # harness wrote both — we just point HOME at the same fake-home.
+    fake_home = FAKE_HOME_FROM_INSTALL
 
     print(f"HOME redirected to {fake_home}")
-    print(f"toolkits visible: {[p.name for p in (fake_home / '.scitoolkit' / 'toolkits').iterdir()]}")
+    print(f"toolkits visible: {[p.name for p in INSTALL_CACHE.iterdir()]}")
     print(f"using scitoolkit at: {scitoolkit_bin}")
     print()
 

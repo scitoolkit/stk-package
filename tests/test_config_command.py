@@ -28,17 +28,16 @@ from scitoolkit.setup import (
 
 @pytest.fixture
 def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect both CONFIG_DIR and TOOLKITS_DIR to tmp_path subtree.
+    """Redirect CONFIG_DIR so the entire scitoolkit substrate lands in tmp.
 
-    The ``config`` group's commands resolve the toolkit's source
-    ``toolkit.yaml`` from TOOLKITS_DIR. We seed both directories so
-    every test gets an isolated environment.
+    The 0.5.0 cache layout puts toolkit binaries under
+    ``~/.scitoolkit/cache/<name>/<version>/``. The resolver pattern in
+    ``envs/paths.py`` re-reads ``CONFIG_DIR`` on every call so a single
+    monkeypatch suffices.
     """
     fake = tmp_path / "scitoolkit"
     fake.mkdir()
-    (fake / "toolkits").mkdir()
     monkeypatch.setattr(scitoolkit_config, "CONFIG_DIR", fake)
-    monkeypatch.setattr(scitoolkit_config, "TOOLKITS_DIR", fake / "toolkits")
     return fake
 
 
@@ -47,12 +46,16 @@ def _install_synthetic(
     name: str = "demo",
     config_block=None,
 ) -> Path:
-    """Drop a minimal toolkit.yaml + .stk_meta.json under TOOLKITS_DIR/<name>/."""
-    tk = base / "toolkits" / name
+    """Drop a minimal cache slot with toolkit.yaml + .stk_meta.json.
+
+    Mirrors the 0.5.0 layout: ``base/cache/<name>/<version>/``.
+    """
+    version = "0.1.0"
+    tk = base / "cache" / name / version
     tk.mkdir(parents=True)
     yaml_data = {
         "name": name,
-        "version": "0.1.0",
+        "version": version,
         "description": "x",
         "author": "test",
         "category": "other",
@@ -62,7 +65,7 @@ def _install_synthetic(
         yaml_data["config"] = config_block
     (tk / "toolkit.yaml").write_text(_yaml.safe_dump(yaml_data))
     (tk / ".stk_meta.json").write_text(json.dumps({
-        "name": name, "version": "0.1.0", "environment": "venv",
+        "name": name, "version": version, "environment": "venv",
         "python_path": "/usr/bin/python", "python_version": "3.12",
     }))
     return tk

@@ -122,16 +122,15 @@ def _setup_synthetic_install() -> Path:
     fake_home = WORK_ROOT
     (fake_home / ".scitoolkit").symlink_to(INSTALL_ROOT)
     INSTALL_ROOT.mkdir(parents=True)
-    (INSTALL_ROOT / "toolkits").mkdir()
-    (INSTALL_ROOT / "config").mkdir()
     (INSTALL_ROOT / "logs").mkdir()
-    (INSTALL_ROOT / "cache").mkdir()
+    (INSTALL_ROOT / "downloads").mkdir()
 
-    dest = INSTALL_ROOT / "toolkits" / TOOLKIT_NAME
+    version = "0.1.0"
+    dest = INSTALL_ROOT / "cache" / TOOLKIT_NAME / version
     shutil.copytree(TOOLKIT_SRC, dest)
 
     meta = {
-        "name": TOOLKIT_NAME, "version": "0.1.0",
+        "name": TOOLKIT_NAME, "version": version,
         "environment": "venv",
         "python_path": sys.executable,
         "python_version": (
@@ -141,6 +140,11 @@ def _setup_synthetic_install() -> Path:
         "needs_setup": True,
     }
     (dest / ".stk_meta.json").write_text(json.dumps(meta, indent=2))
+    from scitoolkit.envs import write_install_meta as _wim
+    _wim(dest, name=TOOLKIT_NAME, version=version,
+         install_method="venv",
+         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+         extras={"python_path": sys.executable, "has_setup_script": True})
     return dest
 
 
@@ -241,14 +245,14 @@ def main() -> int:
     print("=" * 64)
     print("Step 4: orchestrator serves; verify mixed Tier-1 / Tier-2 state")
     print("=" * 64)
-    orch = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch = orchestrator.Orchestrator()
     orch.start()
 
     rt = orch._runtimes.get(TOOLKIT_NAME)
     if rt is None:
         print(f"!!! toolkit {TOOLKIT_NAME!r} did not load")
         return 7
-    print(f"  ✓ toolkit loaded: state={rt.state.name} pid={rt.proc.pid}")
+    print(f"  ✓ toolkit loaded: state={rt.state.name}")
 
     proxies = {p.get_name(): p for p in orch._proxy_tools}
     qualified = f"{TOOLKIT_NAME}__get_observation"
@@ -304,7 +308,7 @@ def main() -> int:
         return 11
     print("  ✓ validate(ctx) returned False after sentinel removal")
 
-    orch2 = orchestrator.Orchestrator(toolkits_dir=INSTALL_ROOT / "toolkits")
+    orch2 = orchestrator.Orchestrator()
     try:
         orch2.start()
     except RuntimeError as e:

@@ -249,7 +249,10 @@ def download(
     destination = Path(destination)
 
     if cache_dir is None:
-        cache_dir = Path.home() / ".scitoolkit" / "cache"
+        # 0.5.0: was ``~/.scitoolkit/cache/`` — relocated to
+        # ``~/.scitoolkit/downloads/`` to make room for the new
+        # cache-of-toolkit-binaries layout under ``cache/<name>/<version>/``.
+        cache_dir = Path.home() / ".scitoolkit" / "downloads"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # The "live" file is in the cache. We move/copy from cache into

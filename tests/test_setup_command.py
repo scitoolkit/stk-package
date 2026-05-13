@@ -28,14 +28,13 @@ from click.testing import CliRunner
 def _make_install(home: Path, name: str, *,
                   has_setup_py: bool = False, config_block: list = None,
                   declare_setup_script: bool = False) -> Path:
-    """Synthesize an installed toolkit under ~/.scitoolkit/toolkits/."""
-    toolkits = home / ".scitoolkit" / "toolkits"
-    toolkits.mkdir(parents=True, exist_ok=True)
-    tdir = toolkits / name
-    tdir.mkdir()
+    """Synthesize an installed toolkit in the 0.5.0 cache layout."""
+    version = "0.1.0"
+    tdir = home / ".scitoolkit" / "cache" / name / version
+    tdir.mkdir(parents=True, exist_ok=True)
 
     yaml_data = {
-        "name": name, "version": "0.1.0",
+        "name": name, "version": version,
         "category": "misc", "description": "test",
     }
     if config_block:
@@ -45,7 +44,7 @@ def _make_install(home: Path, name: str, *,
     (tdir / "toolkit.yaml").write_text(yaml.safe_dump(yaml_data))
 
     (tdir / ".stk_meta.json").write_text(json.dumps({
-        "name": name, "version": "0.1.0",
+        "name": name, "version": version,
         "environment": "venv",
         "python_path": sys.executable,
         "python_version": (
@@ -62,15 +61,13 @@ def _make_install(home: Path, name: str, *,
 
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):
-    """Patch HOME and the config module's resolved paths."""
+    """Patch HOME and CONFIG_DIR so the substrate lands under tmp."""
     home = tmp_path / "home"
     home.mkdir()
     (home / ".scitoolkit").mkdir()
     monkeypatch.setenv("HOME", str(home))
     import scitoolkit.config as _cfg
-    monkeypatch.setattr(_cfg, "CONFIG_DIR", home / ".scitoolkit" / "config")
-    monkeypatch.setattr(_cfg, "TOOLKITS_DIR", home / ".scitoolkit" / "toolkits")
-    monkeypatch.setattr(_cfg, "LOGS_DIR", home / ".scitoolkit" / "logs")
+    monkeypatch.setattr(_cfg, "CONFIG_DIR", home / ".scitoolkit")
     return home
 
 

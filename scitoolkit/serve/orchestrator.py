@@ -144,8 +144,118 @@ class ToolkitRuntime:
 # ── discovery ───────────────────────────────────────────────────────────
 
 
-def discover_toolkits(toolkits_dir: Path = TOOLKITS_DIR) -> List[ToolkitDiscovery]:
-    """Walk ``toolkits_dir`` and classify each entry. Sorted by name."""
+def discover_toolkits(toolkits_dir: Optional[Path] = None) -> List[ToolkitDiscovery]:
+    """Discover installed toolkits from the 0.5.0 cache layout.
+
+    Walks ``~/.scitoolkit/cache/<name>/<version>/`` via
+    ``scitoolkit.envs.walk_cache``. For each entry, selects the version
+    pinned in the active project's manifest if a pin exists; otherwise
+    falls back to the only-installed-version when there's exactly one,
+    or the highest version when there are several (with a soft warning
+    on the skip channel).
+
+    The ``toolkits_dir`` parameter is retained as a back-compat hook for
+    tests that still pass it; if non-None, the function reverts to the
+    legacy walk over that directory (used by the existing test suite
+    pending its migration). Production callers should pass ``None``
+    (the default) so the cache walker is used.
+    """
+    if toolkits_dir is not None:
+        return _legacy_discover_toolkits(toolkits_dir)
+
+    from ..envs import (
+        walk_cache,
+        default_project_root,
+        project_manifest_path,
+        load_manifest,
+    )
+    from ..versioning import parse_version
+
+    entries = walk_cache()
+    if not entries:
+        return []
+
+    # Read the active project's manifest. Phase 2 always uses the
+    # default-project; Phase 3 wires real discovery.
+    pin_by_name: Dict[str, str] = {}
+    try:
+        manifest_path = project_manifest_path(default_project_root())
+        manifest = load_manifest(manifest_path)
+        for e in manifest.toolkits:
+            pin_by_name[e.name] = e.version
+    except Exception:
+        pin_by_name = {}
+
+    # Group cache entries by name.
+    by_name: Dict[str, List] = {}
+    for e in entries:
+        by_name.setdefault(e.name, []).append(e)
+
+    found: List[ToolkitDiscovery] = []
+    for name in sorted(by_name):
+        candidates = by_name[name]
+        pin = pin_by_name.get(name)
+        chosen = None
+        skip_extra = None
+
+        if pin is not None:
+            for c in candidates:
+                if c.version == pin:
+                    chosen = c
+                    break
+            if chosen is None:
+                # Pin exists but no matching slot — install was deleted
+                # outside our knowledge. Skip with a clear reason.
+                # Use the first candidate's path for the discovery
+                # record so the banner still shows the name.
+                chosen = candidates[0]
+                skip_extra = (
+                    f"pinned version {pin} not in cache "
+                    f"(available: {', '.join(c.version for c in candidates)})"
+                )
+        elif len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            # No pin, multiple versions. Pick the highest; log it.
+            chosen = sorted(
+                candidates,
+                key=lambda c: parse_version(c.version) or (0, 0, 0),
+                reverse=True,
+            )[0]
+
+        # Build the legacy-shaped meta dict that the rest of the
+        # orchestrator expects.
+        meta = dict(chosen.legacy_meta)
+        if not meta.get("environment") and chosen.install_meta.get("install_method"):
+            meta["environment"] = chosen.install_meta["install_method"]
+            meta.setdefault(
+                "python_version",
+                chosen.install_meta.get("python_version", "?"),
+            )
+            for k in ("python_path", "env_name"):
+                if k not in meta and k in chosen.install_meta:
+                    meta[k] = chosen.install_meta[k]
+
+        skip: Optional[str] = skip_extra
+        if not skip:
+            env = meta.get("environment")
+            if env == "docker":
+                skip = "Docker mode (Phase 3B not yet supported)"
+            elif env not in ("venv", "conda"):
+                skip = f"unknown environment type: {env!r}"
+
+        found.append(ToolkitDiscovery(
+            name=name, path=chosen.path, meta=meta, skip_reason=skip,
+        ))
+    return found
+
+
+def _legacy_discover_toolkits(toolkits_dir: Path) -> List[ToolkitDiscovery]:
+    """0.4.x walker — still used by tests that haven't migrated yet.
+
+    Walks a flat ``<dir>/<name>/.stk_meta.json`` shape. Production
+    code paths use the cache walker via ``discover_toolkits(None)``.
+    """
     found: List[ToolkitDiscovery] = []
     if not toolkits_dir.exists():
         return found
@@ -175,12 +285,6 @@ def discover_toolkits(toolkits_dir: Path = TOOLKITS_DIR) -> List[ToolkitDiscover
             skip = "Docker mode (Phase 3B not yet supported)"
         elif env not in ("venv", "conda"):
             skip = f"unknown environment type: {env!r}"
-        # NB: ``meta.get("needs_setup")`` (Tier-2 setup.py present)
-        # used to skip here in 3C-1 with "Phase 3C-2 not yet runnable."
-        # That gate is now lifted; ``_resolve_state_config`` calls
-        # ``validate_setup_script_cached`` for setup_script toolkits
-        # and surfaces the validate result as the skip reason if it
-        # fails.
 
         found.append(ToolkitDiscovery(
             name=entry.name, path=entry, meta=meta, skip_reason=skip,
@@ -450,7 +554,7 @@ class Orchestrator:
         self,
         *,
         console: Optional[Console] = None,
-        toolkits_dir: Path = TOOLKITS_DIR,
+        toolkits_dir: Optional[Path] = None,
         resolved: Optional[Any] = None,  # serve.config.ResolvedSet, optional
         call_timeout_s: float = DEFAULT_CALL_TIMEOUT_S,
     ):
@@ -458,6 +562,10 @@ class Orchestrator:
         # Stderr console because stdin/stdout are owned by MCP stdio in the
         # serve flow — anything we print to stdout would corrupt the
         # protocol stream.
+        #
+        # ``toolkits_dir`` is None in production — the 0.5.0 cache layout
+        # discovers via ``walk_cache()``. Some tests still pass an explicit
+        # legacy path; that path takes the back-compat walker.
         self.toolkits_dir = toolkits_dir
         self.logger = get_logger(serve_log=True)
         self._runtimes: Dict[str, ToolkitRuntime] = {}
@@ -687,6 +795,14 @@ class Orchestrator:
             )
             return
         assert spawn is not None  # for type checkers
+
+        # Touch ``.last_used`` so ``stk list`` shows the slot was activated.
+        # Best-effort — touch_last_used never raises.
+        try:
+            from ..envs import touch_last_used as _touch_last_used
+            _touch_last_used(disc.path)
+        except Exception:
+            pass
 
         self.logger.log_event(
             "mcp_client_connected", toolkit=disc.name,
