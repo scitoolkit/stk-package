@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.5.4] — 2026-05-15
+
+CLI-side completion of Backend's 2026-05-15 token-prefix rotation. The per-user CLI token prefix changed `sct_user_` → `stk_user_`; this release teaches the CLI to recognize the new prefix as canonical, reject the retired one at paste time, and short-circuit any authenticated command whose stored `~/.scitoolkit/token` still uses the old prefix — with a clear "run `scitoolkit logout && scitoolkit login`" message — *before* hitting the backend.
+
+### Changed
+
+- **`stk_user_` is now the canonical per-user CLI token prefix.** `auth.is_user_token` recognizes `stk_user_`; help text, login UX, and error messages all reference the new prefix. The browser flow's happy path works unchanged: Backend mints `stk_user_`, the CLI accepts and stores it.
+- **`sct_user_` is the retired per-user prefix.** `auth.is_retired_user_token` is the new classifier; the constant `auth.RETIRED_USER_TOKEN_PREFIX` is the single source of truth for the retired string. The retired prefix is not accepted in any code path that writes to `~/.scitoolkit/token`.
+- **`auth.is_legacy_toolkit_token` now explicitly excludes `stk_user_`.** The per-toolkit-token classifier previously matched anything starting with `stk_`, which would have falsely matched the new per-user prefix. The two deprecation tracks (per-user prefix rotation and per-toolkit-token phase-out) are now correctly separated.
+
+### Added
+
+- **Pre-flight stale-token detection.** New `_abort_if_stored_token_is_retired()` helper in `cli.py` and `auth.stored_token_is_retired()` in `auth.py`. Called from `scitoolkit whoami`, `scitoolkit create`, and `scitoolkit publish` before any HTTP request. If the stored token uses the retired `sct_user_` prefix, the CLI exits 1 with the migration message — works offline, gives the same actionable error in every authenticated command.
+- **Paste-mode rejection.** `scitoolkit login --token sct_user_xyz` errors with the migration message and writes nothing to disk. Same rejection for the legacy-form footgun `scitoolkit login <toolkit> --token sct_user_...`.
+
+### Tests
+
+- New unit tests in `tests/test_auth.py`: `is_retired_user_token` classifier (positive + negative cases), `stored_token_is_retired` for stale / fresh / missing-file states, updated `is_legacy_toolkit_token` to assert per-user-prefix exclusion.
+- New integration tests in `tests/test_login_command.py`: paste-mode rejects retired-prefix token (no disk write), `whoami` short-circuits a stale stored token without any HTTP call (mock asserts call count = 0), `create` short-circuits a stale stored token without any `requests.post` call, fresh-token round-trip via paste, fresh-token `whoami` proceeds to backend call.
+- Existing fixture tokens updated: `sct_user_*` → `stk_user_*` across `test_auth.py`, `test_login_command.py`, `test_serve_state_config.py`, `test_setup_storage.py`. 937 unit tests green.
+
+### Internal
+
+- Comments referencing the migration history are preserved as-is per the brief — `sct_user_` mentions in docstrings and historical context explain *why* the rotation happened; active validation logic uses the new constants.
+
+---
+
 ## [0.4.1] — TBD (in tree, not yet shipped)
 
 Bundle of two coherent pieces of work, neither big enough to warrant its own release: CLI-driven toolkit creation (eliminating the website round-trip from the agent-onboarding flow), and Orchestral 1.4 stdio MCPClient cleanup (retiring the ~150-200 LOC HTTP-loopback machinery in `serve/orchestrator.py` now that Orchestral 1.4's persistent stdio client makes it unnecessary).

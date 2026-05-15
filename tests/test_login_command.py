@@ -75,11 +75,30 @@ def test_login_legacy_rejects_user_token_pasted_into_legacy_form(isolated_config
     runner = CliRunner()
     result = runner.invoke(
         cli.main,
-        ["login", "aster", "--token", "sct_user_abc"],
+        ["login", "aster", "--token", "stk_user_abc"],
     )
     assert result.exit_code == 1
     assert "per-user token" in result.output.lower()
     # No file should have been written.
+    assert not (isolated_config / "aster" / "token").exists()
+
+
+def test_login_legacy_rejects_retired_sct_user_pasted_into_legacy_form(
+    isolated_config: Path,
+):
+    """A retired sct_user_ token in the legacy form errors with the
+    stale-token migration message (and writes nothing)."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["login", "aster", "--token", "sct_user_old"],
+    )
+    assert result.exit_code == 1
+    # Stale-token message references both the retired prefix and the
+    # required re-login flow.
+    assert "sct_user_" in result.output
+    assert "scitoolkit logout" in result.output
+    assert "scitoolkit login" in result.output
     assert not (isolated_config / "aster" / "token").exists()
 
 
@@ -102,10 +121,10 @@ def test_login_paste_user_token(isolated_config: Path):
     runner = CliRunner()
     result = runner.invoke(
         cli.main,
-        ["login", "--token", "sct_user_abc"],
+        ["login", "--token", "stk_user_abc"],
     )
     assert result.exit_code == 0, result.output
-    assert auth.load_user_token() == "sct_user_abc"
+    assert auth.load_user_token() == "stk_user_abc"
 
 
 def test_login_paste_rejects_legacy_token(isolated_config: Path):
@@ -155,7 +174,7 @@ def _patch_browser_flow(monkeypatch, result: auth.BrowserFlowResult):
 def test_login_browser_flow_happy_path(isolated_config: Path, monkeypatch):
     _patch_browser_flow(
         monkeypatch,
-        auth.BrowserFlowResult(token="sct_user_browser"),
+        auth.BrowserFlowResult(token="stk_user_browser"),
     )
     runner = CliRunner()
     # Force interactive mode so the flow doesn't get short-circuited
@@ -163,7 +182,7 @@ def test_login_browser_flow_happy_path(isolated_config: Path, monkeypatch):
     # auto-detected as skip).
     result = runner.invoke(cli.main, ["login", "--yes"])
     assert result.exit_code == 0, result.output
-    assert auth.load_user_token() == "sct_user_browser"
+    assert auth.load_user_token() == "stk_user_browser"
 
 
 def test_login_browser_flow_denied(isolated_config: Path, monkeypatch):
@@ -203,7 +222,7 @@ def test_login_browser_flow_state_mismatch_error(isolated_config: Path, monkeypa
 def test_login_browser_flow_returns_malformed_token_rejected(
     isolated_config: Path, monkeypatch,
 ):
-    """Defense-in-depth: if the website ever returns a non-sct_user_ token, refuse."""
+    """Defense-in-depth: if the website ever returns a non-stk_user_ token, refuse."""
     _patch_browser_flow(
         monkeypatch,
         auth.BrowserFlowResult(token="garbage"),
@@ -232,7 +251,7 @@ def test_login_migration_prompt_detects_legacy_files(
 
     _patch_browser_flow(
         monkeypatch,
-        auth.BrowserFlowResult(token="sct_user_consolidated"),
+        auth.BrowserFlowResult(token="stk_user_consolidated"),
     )
 
     runner = CliRunner()
@@ -242,7 +261,7 @@ def test_login_migration_prompt_detects_legacy_files(
     assert result.exit_code == 0, result.output
     assert "Detected legacy per-toolkit tokens" in result.output
     assert "aster" in result.output and "heptapod" in result.output
-    assert auth.load_user_token() == "sct_user_consolidated"
+    assert auth.load_user_token() == "stk_user_consolidated"
     # Legacy files preserved (cleanup is logout --clean-legacy's job).
     assert (isolated_config / "aster" / "token").exists()
     assert (isolated_config / "heptapod" / "token").exists()
@@ -264,7 +283,7 @@ def test_login_migration_prompt_user_declines_exits_zero(
 
 
 def test_logout_removes_user_token(isolated_config: Path):
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     runner = CliRunner()
     result = runner.invoke(cli.main, ["logout"])
     assert result.exit_code == 0, result.output
@@ -291,7 +310,7 @@ def test_logout_no_user_but_legacy_present_hints_at_clean_legacy(
 
 
 def test_logout_clean_legacy_removes_both(isolated_config: Path):
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     auth.save_legacy_toolkit_token("aster", "stk_a")
     auth.save_legacy_toolkit_token("heptapod", "stk_h")
 
@@ -304,7 +323,7 @@ def test_logout_clean_legacy_removes_both(isolated_config: Path):
 
 def test_logout_clean_legacy_no_to_prompt_keeps_files(isolated_config: Path):
     """--clean-legacy --no aborts the cleanup confirmation."""
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     auth.save_legacy_toolkit_token("aster", "stk_a")
 
     runner = CliRunner()
@@ -335,7 +354,7 @@ def test_whoami_legacy_only_hints_at_consolidation(isolated_config: Path):
 
 
 def test_whoami_renders_user_info(isolated_config: Path, monkeypatch):
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     monkeypatch.setattr(
         auth, "whoami",
         lambda token, **kw: {
@@ -354,7 +373,7 @@ def test_whoami_renders_user_info(isolated_config: Path, monkeypatch):
 
 
 def test_whoami_api_failure_surfaces_clearly(isolated_config: Path, monkeypatch):
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     monkeypatch.setattr(auth, "whoami", lambda token, **kw: None)
     runner = CliRunner()
     result = runner.invoke(cli.main, ["whoami"])
@@ -367,7 +386,7 @@ def test_whoami_api_failure_surfaces_clearly(isolated_config: Path, monkeypatch)
 
 def test_publish_uses_user_token_when_available(isolated_config: Path, tmp_path: Path, monkeypatch):
     """Smoke test: publish flow loads per-user token and dies at network step."""
-    auth.save_user_token("sct_user_x")
+    auth.save_user_token("stk_user_x")
     auth.save_legacy_toolkit_token("demo", "stk_old")
 
     # Build a minimal toolkit dir to satisfy the up-front yaml + validate steps.
@@ -387,7 +406,7 @@ def test_publish_uses_user_token_when_available(isolated_config: Path, tmp_path:
     # behavior tested here is "user token wins over legacy token."
     token, source = auth.load_token_for_publish("demo")
     assert source == "user"
-    assert token == "sct_user_x"
+    assert token == "stk_user_x"
 
 
 def test_publish_falls_back_to_legacy_when_no_user_token(isolated_config: Path):
@@ -401,3 +420,110 @@ def test_publish_no_token_returns_none(isolated_config: Path):
     token, source = auth.load_token_for_publish("ghost")
     assert token is None
     assert source == "none"
+
+
+# ── 2026-05-15 prefix-rotation behaviors ──────────────────────────────
+#
+# Backend rotated CLI per-user token prefix sct_user_ → stk_user_ on
+# 2026-05-15. The CLI now (a) rejects sct_user_ at paste-time before
+# anything hits disk, and (b) short-circuits any authenticated command
+# whose stored ~/.scitoolkit/token still uses the retired prefix,
+# before any HTTP request.
+
+
+def test_login_paste_rejects_retired_sct_user_token(isolated_config: Path):
+    """Paste-mode rejects an sct_user_ token with the migration message,
+    and does NOT write it to disk."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["login", "--token", "sct_user_old"],
+    )
+    assert result.exit_code == 1
+    # Migration message references the retired prefix + the recovery path.
+    assert "sct_user_" in result.output
+    assert "scitoolkit login" in result.output
+    # Critical: the stale token must NOT land on disk.
+    assert auth.load_user_token() is None
+
+
+def test_whoami_stale_token_short_circuits_before_http(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A stored sct_user_ token short-circuits ``whoami`` with the
+    migration message before any HTTP request is made."""
+    auth.save_user_token("sct_user_stale")
+
+    called = {"n": 0}
+
+    def fake_whoami(*a, **kw):
+        called["n"] += 1
+        return {"email": "should-not-be-called@example.com"}
+
+    monkeypatch.setattr(auth, "whoami", fake_whoami)
+
+    runner = CliRunner()
+    result = runner.invoke(cli.main, ["whoami"])
+
+    assert result.exit_code == 1
+    assert called["n"] == 0, "whoami() should not be called when token is stale"
+    assert "sct_user_" in result.output
+    assert "scitoolkit logout" in result.output
+    assert "scitoolkit login" in result.output
+
+
+def test_create_stale_token_short_circuits_before_http(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A stored sct_user_ token short-circuits ``create`` before any
+    requests.post call to the registry."""
+    import requests as rq
+
+    auth.save_user_token("sct_user_stale")
+
+    def fake_post(*a, **kw):
+        raise AssertionError("requests.post should not be called")
+
+    monkeypatch.setattr(rq, "post", fake_post)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["create", "tk-demo", "--category", "other",
+         "--description", "x", "--no-input"],
+    )
+    assert result.exit_code == 1
+    assert "sct_user_" in result.output
+
+
+def test_login_paste_accepts_fresh_stk_user_token(isolated_config: Path):
+    """Round-trip: stk_user_ token via --token paste stores cleanly."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["login", "--token", "stk_user_fresh"],
+    )
+    assert result.exit_code == 0, result.output
+    assert auth.load_user_token() == "stk_user_fresh"
+
+
+def test_whoami_proceeds_with_fresh_stk_user_token(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Counter-test: a fresh stk_user_ token does NOT trigger the
+    pre-flight short-circuit; whoami proceeds to the backend call."""
+    auth.save_user_token("stk_user_fresh")
+
+    called = {"n": 0}
+
+    def fake_whoami(token, **kw):
+        called["n"] += 1
+        return {"email": "alice@example.com", "auth_method": "stk_user"}
+
+    monkeypatch.setattr(auth, "whoami", fake_whoami)
+
+    runner = CliRunner()
+    result = runner.invoke(cli.main, ["whoami"])
+    assert result.exit_code == 0, result.output
+    assert called["n"] == 1
+    assert "alice@example.com" in result.output

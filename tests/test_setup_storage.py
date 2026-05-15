@@ -73,12 +73,12 @@ def test_load_missing_returns_empty(isolated_config: Path):
 
 
 def test_save_then_load_round_trip(isolated_config: Path):
-    storage.save_config("demo", {"api_key": "sct_user_xx", "count": 4})
+    storage.save_config("demo", {"api_key": "stk_user_xx", "count": 4})
     data = storage.load_config("demo")
     # 0.5.0: schema_version: 1 is stamped on every save. Strip the
     # envelope from the comparison; we care about the body.
     body = {k: v for k, v in data.items() if k != "schema_version"}
-    assert body == {"api_key": "sct_user_xx", "count": 4}
+    assert body == {"api_key": "stk_user_xx", "count": 4}
     assert data["schema_version"] == 1
 
 

@@ -16,10 +16,19 @@ STATUS.md.
 
 Token prefixes the CLI must distinguish:
 
-- ``sct_user_...`` — per-user CLI token (the post-Phase-A standard).
-  Stored at ``USER_TOKEN_PATH``.
-- ``stk_...`` — per-toolkit token (legacy). Stored at
-  ``CONFIG_DIR/<toolkit>/token``. Kept working through Phase B.
+- ``stk_user_...`` — per-user CLI token (the post-2026-05-15 standard).
+  Stored at ``USER_TOKEN_PATH``. Backend rotated the prefix from
+  ``sct_user_`` to ``stk_user_`` on 2026-05-15.
+- ``sct_user_...`` — **retired** per-user CLI token prefix
+  (pre-2026-05-15). Backend no longer issues these; CLI rejects them at
+  paste time and short-circuits any command that finds one in
+  ``~/.scitoolkit/token`` with a "run scitoolkit logout && scitoolkit
+  login" message before any HTTP call.
+- ``stk_...`` — per-toolkit token (legacy from a different deprecation
+  track). Stored at ``CONFIG_DIR/<toolkit>/token``. Kept working through
+  Phase B. **NB:** the per-toolkit prefix is ``stk_`` (no ``user_``);
+  the per-user prefix is ``stk_user_``. The two are distinguished by
+  whether ``user_`` follows ``stk_``.
 - ``toolkit_...`` — earliest MVP per-toolkit prefix. Treated as
   ``stk_`` for compatibility (some users still have these).
 
@@ -107,16 +116,89 @@ WEB_AUTH_PATH = "/cli-auth"     # path under the website host
 
 
 # ── prefix helpers ─────────────────────────────────────────────────────
+#
+# Two deprecation tracks meet here:
+#
+# 1. ``sct_user_`` → ``stk_user_`` — 2026-05-15 backend rollover. The
+#    per-user CLI token's prefix changed; old ``sct_user_`` tokens were
+#    invalidated server-side. CLI must reject ``sct_user_`` at paste
+#    time, short-circuit any command that finds one stored locally, and
+#    accept ``stk_user_`` as canonical.
+#
+# 2. Per-toolkit ``stk_...`` / ``toolkit_...`` — the much older
+#    per-toolkit-token system, kept alive through Phase B but not on
+#    the active track for new logins. **NB:** the per-toolkit prefix is
+#    ``stk_`` (no ``user_``); the per-user prefix is ``stk_user_``. The
+#    two share a leading ``stk_`` but the per-toolkit-token classifier
+#    must NOT match per-user tokens, hence the explicit ``user_`` check
+#    in ``is_legacy_toolkit_token``.
+
+# The canonical per-user prefix (current). Constant so it's a single
+# point of change if it rolls again.
+USER_TOKEN_PREFIX = "stk_user_"
+
+# The retired per-user prefix. The backend stopped issuing these on
+# 2026-05-15. CLI rejects on paste and short-circuits on any stored
+# value matching this prefix.
+RETIRED_USER_TOKEN_PREFIX = "sct_user_"
 
 
 def is_user_token(token: str) -> bool:
-    """A per-user CLI token (post-Phase-A standard)."""
-    return token.startswith("sct_user_")
+    """A per-user CLI token (post-2026-05-15 standard, ``stk_user_``)."""
+    return token.startswith(USER_TOKEN_PREFIX)
+
+
+def is_retired_user_token(token: str) -> bool:
+    """A per-user CLI token using the **retired** ``sct_user_`` prefix.
+
+    Backend stopped issuing these on 2026-05-15. The CLI catches stored
+    values matching this prefix at the pre-flight step and short-
+    circuits with a clear "rerun ``scitoolkit logout && scitoolkit
+    login``" message rather than letting the request hit the backend
+    and come back with an opaque 401.
+    """
+    return token.startswith(RETIRED_USER_TOKEN_PREFIX)
 
 
 def is_legacy_toolkit_token(token: str) -> bool:
-    """A per-toolkit publish token (Phase 0 / Phase 1 legacy)."""
+    """A per-toolkit publish token (Phase 0 / Phase 1 legacy).
+
+    Distinct from the per-user-prefix-retirement track. Per-toolkit
+    tokens start with ``stk_`` (not followed by ``user_``) or
+    ``toolkit_``. Returns False for per-user tokens that happen to
+    share the ``stk_`` leading characters.
+    """
+    if token.startswith(USER_TOKEN_PREFIX):
+        # stk_user_... is a per-user token, not a per-toolkit token.
+        return False
     return token.startswith("stk_") or token.startswith("toolkit_")
+
+
+# ── stale-token pre-flight ─────────────────────────────────────────────
+
+
+# Sentinel surfaced to the CLI; matches the wording in the brief.
+STALE_TOKEN_MESSAGE = (
+    "Your stored CLI token uses the retired sct_user_ prefix.\n"
+    "  Run `scitoolkit logout && scitoolkit login` to get a "
+    "fresh stk_user_ token."
+)
+
+
+def stored_token_is_retired(*, path: Optional[Path] = None) -> bool:
+    """True iff the on-disk per-user token uses the retired prefix.
+
+    Cheap, offline check. Returns False when no token is stored.
+    Callers (commands that authenticate against the backend) should
+    invoke this before any HTTP request and short-circuit with
+    ``STALE_TOKEN_MESSAGE`` when it returns True — saves a backend
+    round-trip and gives the same actionable error in offline /
+    network-down scenarios.
+    """
+    token = load_user_token(path=path)
+    if not token:
+        return False
+    return is_retired_user_token(token)
 
 
 # ── token storage: per-user ───────────────────────────────────────────
@@ -307,7 +389,7 @@ class BrowserFlow:
     3. Construct the auth URL: ``<web_base>/cli-auth?callback=...&state=...&hostname=...``
     4. Open the user's browser at that URL.
     5. Wait for a single POST to ``/cli-callback`` carrying either
-       ``{"state": ..., "token": "sct_user_..."}`` (approval) or
+       ``{"state": ..., "token": "stk_user_..."}`` (approval) or
        ``{"state": ..., "denied": true}`` (denial).
     6. Validate the state nonce and return.
 

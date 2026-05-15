@@ -2,7 +2,8 @@
 
 Covers:
 
-- Prefix classification (``sct_user_`` vs ``stk_`` vs ``toolkit_``).
+- Prefix classification (``stk_user_`` canonical, ``sct_user_`` retired,
+  ``stk_`` / ``toolkit_`` legacy per-toolkit).
 - Token storage helpers (per-user + legacy per-toolkit). Mode 0600
   set; missing-file behavior; empty-file edge cases.
 - Migration helpers (``find_legacy_token_files``,
@@ -34,18 +35,46 @@ from scitoolkit import auth
 # ── prefix classification ─────────────────────────────────────────────
 
 
-def test_is_user_token_recognizes_sct_user():
-    assert auth.is_user_token("sct_user_abc123")
+def test_is_user_token_recognizes_stk_user():
+    assert auth.is_user_token("stk_user_abc123")
 
 
 def test_is_user_token_rejects_other_prefixes():
-    assert not auth.is_user_token("stk_abc123")
+    assert not auth.is_user_token("stk_abc123")  # per-toolkit legacy
     assert not auth.is_user_token("toolkit_abc123")
-    assert not auth.is_user_token("sct_user")  # no underscore-suffix; defensive
+    assert not auth.is_user_token("sct_user_abc")  # retired prefix
+    assert not auth.is_user_token("stk_user")  # no underscore-suffix; defensive
     assert not auth.is_user_token("")
-    # Note: "sct_user" alone (without trailing chars) is technically
-    # caught by startswith, but we don't enforce strict suffix length —
-    # backend will reject malformed tokens.
+
+
+def test_is_retired_user_token_recognizes_sct_user():
+    # Post-2026-05-15 rollover: sct_user_ is the retired prefix the
+    # backend no longer accepts. CLI must classify it for the
+    # short-circuit / paste-rejection paths.
+    assert auth.is_retired_user_token("sct_user_abc123")
+
+
+def test_is_retired_user_token_rejects_other_prefixes():
+    assert not auth.is_retired_user_token("stk_user_abc123")
+    assert not auth.is_retired_user_token("stk_abc123")
+    assert not auth.is_retired_user_token("toolkit_abc123")
+    assert not auth.is_retired_user_token("")
+
+
+def test_stored_token_is_retired_true_for_sct_user(tmp_path: Path):
+    p = tmp_path / "token"
+    p.write_text("sct_user_stale")
+    assert auth.stored_token_is_retired(path=p)
+
+
+def test_stored_token_is_retired_false_for_stk_user(tmp_path: Path):
+    p = tmp_path / "token"
+    p.write_text("stk_user_fresh")
+    assert not auth.stored_token_is_retired(path=p)
+
+
+def test_stored_token_is_retired_false_for_missing_file(tmp_path: Path):
+    assert not auth.stored_token_is_retired(path=tmp_path / "absent")
 
 
 def test_is_legacy_toolkit_token_accepts_both_prefixes():
@@ -54,6 +83,10 @@ def test_is_legacy_toolkit_token_accepts_both_prefixes():
 
 
 def test_is_legacy_toolkit_token_rejects_user_token():
+    # Both forms of per-user prefix must not be classified as
+    # per-toolkit (the two tracks are separate; per-toolkit
+    # classifier excludes stk_user_ explicitly).
+    assert not auth.is_legacy_toolkit_token("stk_user_abc")
     assert not auth.is_legacy_toolkit_token("sct_user_abc")
 
 
@@ -62,19 +95,19 @@ def test_is_legacy_toolkit_token_rejects_user_token():
 
 def test_save_and_load_user_token(tmp_path: Path):
     p = tmp_path / "token"
-    auth.save_user_token("sct_user_abc", path=p)
-    assert auth.load_user_token(path=p) == "sct_user_abc"
+    auth.save_user_token("stk_user_abc", path=p)
+    assert auth.load_user_token(path=p) == "stk_user_abc"
 
 
 def test_save_user_token_strips_whitespace(tmp_path: Path):
     p = tmp_path / "token"
-    auth.save_user_token("  sct_user_abc\n", path=p)
-    assert p.read_text() == "sct_user_abc"
+    auth.save_user_token("  stk_user_abc\n", path=p)
+    assert p.read_text() == "stk_user_abc"
 
 
 def test_save_user_token_sets_0600_on_posix(tmp_path: Path):
     p = tmp_path / "token"
-    auth.save_user_token("sct_user_abc", path=p)
+    auth.save_user_token("stk_user_abc", path=p)
     import os
     import stat
     mode = stat.S_IMODE(os.stat(p).st_mode)
@@ -96,7 +129,7 @@ def test_load_user_token_empty_returns_none(tmp_path: Path):
 
 def test_delete_user_token_removes_file(tmp_path: Path):
     p = tmp_path / "token"
-    p.write_text("sct_user_abc")
+    p.write_text("stk_user_abc")
     assert auth.delete_user_token(path=p) is True
     assert not p.exists()
 
@@ -161,13 +194,13 @@ def test_delete_legacy_token_files_removes_all(tmp_path: Path):
 
 def test_load_token_for_publish_prefers_user(tmp_path: Path):
     user_path = tmp_path / "token"
-    auth.save_user_token("sct_user_x", path=user_path)
+    auth.save_user_token("stk_user_x", path=user_path)
     auth.save_legacy_toolkit_token("aster", "stk_a", base=tmp_path)
 
     token, source = auth.load_token_for_publish(
         "aster", base=tmp_path, user_path=user_path
     )
-    assert token == "sct_user_x"
+    assert token == "stk_user_x"
     assert source == "user"
 
 
@@ -276,10 +309,10 @@ def test_browser_flow_happy_path():
     flow = auth.BrowserFlow(timeout_s=10.0)
 
     def make_payload(_callback_url: str) -> dict:
-        return {"state": flow.state, "token": "sct_user_happy"}
+        return {"state": flow.state, "token": "stk_user_happy"}
 
     result = _drive_browser_flow(flow, make_payload)
-    assert result.token == "sct_user_happy"
+    assert result.token == "stk_user_happy"
     assert not result.denied
     assert not result.timed_out
     assert result.error is None
@@ -302,7 +335,7 @@ def test_browser_flow_state_mismatch_rejected():
     flow = auth.BrowserFlow(timeout_s=10.0)
 
     def make_payload(_callback_url: str) -> dict:
-        return {"state": "WRONG_STATE", "token": "sct_user_should_not_land"}
+        return {"state": "WRONG_STATE", "token": "stk_user_should_not_land"}
 
     result = _drive_browser_flow(flow, make_payload)
     assert result.token is None
@@ -392,7 +425,7 @@ def test_whoami_returns_dict_on_200():
         "name": "Alice", "auth_method": "cli_token",
     }
     with patch("requests.get", return_value=fake_response):
-        info = auth.whoami("sct_user_x")
+        info = auth.whoami("stk_user_x")
     assert info is not None
     assert info["email"] == "alice@example.com"
 
@@ -412,7 +445,7 @@ def test_whoami_returns_none_on_network_error():
         "requests.get",
         side_effect=_requests.exceptions.ConnectionError("dns fail"),
     ):
-        info = auth.whoami("sct_user_x")
+        info = auth.whoami("stk_user_x")
     assert info is None
 
 
@@ -420,7 +453,7 @@ def test_revoke_token_returns_true_on_2xx():
     fake_response = MagicMock()
     fake_response.status_code = 204
     with patch("requests.delete", return_value=fake_response):
-        ok = auth.revoke_token("tok_id_1", "sct_user_x")
+        ok = auth.revoke_token("tok_id_1", "stk_user_x")
     assert ok is True
 
 
@@ -428,7 +461,7 @@ def test_revoke_token_returns_false_on_failure():
     fake_response = MagicMock()
     fake_response.status_code = 404
     with patch("requests.delete", return_value=fake_response):
-        ok = auth.revoke_token("tok_id_1", "sct_user_x")
+        ok = auth.revoke_token("tok_id_1", "stk_user_x")
     assert ok is False
 
 
@@ -439,7 +472,7 @@ def test_revoke_token_returns_false_on_network_error():
         "requests.delete",
         side_effect=_requests.exceptions.ConnectionError("dns fail"),
     ):
-        ok = auth.revoke_token("tok_id_1", "sct_user_x")
+        ok = auth.revoke_token("tok_id_1", "stk_user_x")
     assert ok is False
 
 

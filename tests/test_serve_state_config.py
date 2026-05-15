@@ -71,10 +71,10 @@ def test_all_required_filled_returns_populated_dict(isolated: Path):
         {"name": "api_key", "type": "secret", "required": True},
         {"name": "max_workers", "type": "integer", "default": 4},
     ])
-    save_config("demo", {"api_key": "sct_user_xx"})
+    save_config("demo", {"api_key": "stk_user_xx"})
     state_config, err = orchestrator._resolve_state_config(disc)
     assert err is None
-    assert state_config["api_key"] == "sct_user_xx"
+    assert state_config["api_key"] == "stk_user_xx"
     assert state_config["max_workers"] == 4
 
 

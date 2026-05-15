@@ -156,6 +156,27 @@ def _require_input(
     return click.prompt(label, hide_input=hide_input)
 
 
+def _abort_if_stored_token_is_retired() -> None:
+    """Pre-flight check: short-circuit if ``~/.scitoolkit/token`` is stale.
+
+    The 2026-05-15 backend rollover invalidated all ``sct_user_``
+    tokens. Any command that authenticates against the registry calls
+    this BEFORE making an HTTP request so the user gets a clear
+    actionable message ("run scitoolkit logout && scitoolkit login")
+    instead of an opaque 401 from the backend. Works offline.
+
+    Exits non-zero on hit. No-op when no token is stored or when the
+    stored token is fresh (``stk_user_...``).
+    """
+    from . import auth
+    if auth.stored_token_is_retired():
+        console.print(
+            f"[bold red]✗[/bold red] {auth.STALE_TOKEN_MESSAGE}",
+            style="red",
+        )
+        sys.exit(1)
+
+
 class _SectionedGroup(click.Group):
     """Click group whose ``--help`` renders commands in named sections.
 
@@ -215,7 +236,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.3", prog_name="scitoolkit")
+@click.version_option(version="0.5.4", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -475,6 +496,11 @@ def create(name, category, description, organization, version, yes, no_, no_inpu
     from .validation import get_allowed_categories
 
     mode = _resolve_prompt_mode(yes, no_, no_input)
+
+    # 0. Stale-token pre-flight (post-2026-05-15 rollover). Short-
+    # circuits with a clear migration message before any HTTP request
+    # if the stored token uses the retired sct_user_ prefix.
+    _abort_if_stored_token_is_retired()
 
     # 1. Auth check.
     token = load_user_token()
@@ -985,7 +1011,7 @@ def validate(path):
     '--token', 'token_flag', default=None,
     help=(
         'Provide the token non-interactively. With no toolkit argument, '
-        'expects a per-user token (sct_user_...). With a toolkit argument, '
+        'expects a per-user token (stk_user_...). With a toolkit argument, '
         'expects a legacy per-toolkit token (stk_... or toolkit_...).'
     ),
 )
@@ -997,7 +1023,7 @@ def login(toolkit_name, token_flag, yes, no_, no_input):
     \b
     Modes:
         scitoolkit login                          # browser-flow (recommended)
-        scitoolkit login --token sct_user_...     # paste a per-user token
+        scitoolkit login --token stk_user_...     # paste a per-user token
         scitoolkit login <toolkit>                # legacy per-toolkit (deprecated)
         scitoolkit login <toolkit> --token stk_... # legacy paste mode
 
@@ -1073,9 +1099,14 @@ def _login_legacy_toolkit(toolkit_name: str, token_flag: Optional[str], mode: st
         if auth.is_user_token(token):
             console.print(
                 "It looks like you pasted a per-user token "
-                "([bold]sct_user_...[/bold]) into the legacy form. Use "
+                "([bold]stk_user_...[/bold]) into the legacy form. Use "
                 "[cyan]scitoolkit login --token <token>[/cyan] (no toolkit "
                 "argument) instead."
+            )
+            sys.exit(1)
+        if auth.is_retired_user_token(token):
+            console.print(
+                f"[red]✗ {auth.STALE_TOKEN_MESSAGE}[/red]"
             )
             sys.exit(1)
         if not _confirm("Continue anyway?", default=False, mode=mode, consequential=True):
@@ -1096,6 +1127,21 @@ def _login_paste_user_token(token: str, mode: str) -> None:
     from . import auth
 
     token = token.strip()
+    # Reject retired-prefix tokens before they hit disk. Backend
+    # rotated sct_user_ → stk_user_ on 2026-05-15; CLI tokens issued
+    # before then no longer work. Catching this here gives a clear
+    # actionable message and avoids saving a stale credential that
+    # would just fail at the next HTTP call.
+    if auth.is_retired_user_token(token):
+        console.print(
+            "[red]✗ That token uses the retired sct_user_ prefix. "
+            "CLI tokens issued before 2026-05-15 no longer work.[/red]"
+        )
+        console.print(
+            "Run [cyan]scitoolkit login[/cyan] (no --token flag) to "
+            "start the browser flow and get a fresh stk_user_ token."
+        )
+        sys.exit(1)
     if auth.is_legacy_toolkit_token(token):
         console.print(
             "[red]✗ This looks like a legacy per-toolkit token "
@@ -1110,7 +1156,7 @@ def _login_paste_user_token(token: str, mode: str) -> None:
     if not auth.is_user_token(token):
         console.print(
             "[yellow]Warning: per-user tokens normally start with "
-            "[bold]sct_user_[/bold]. The token you provided doesn't match."
+            "[bold]stk_user_[/bold]. The token you provided doesn't match."
             "[/yellow]"
         )
         if not _confirm("Continue anyway?", default=False, mode=mode, consequential=True):
@@ -1228,7 +1274,7 @@ def _login_browser_flow(mode: str) -> None:
         console.print(
             "[red]✗ The website returned an unexpected token format.[/red]"
         )
-        console.print("[dim]Expected sct_user_... prefix.[/dim]")
+        console.print("[dim]Expected stk_user_... prefix.[/dim]")
         sys.exit(1)
 
     path = auth.save_user_token(result.token)
@@ -1398,6 +1444,12 @@ def whoami():
     account?").
     """
     from . import auth
+
+    # Stale-token pre-flight (post-2026-05-15 rollover). Catches the
+    # case where a user still has an sct_user_ token in
+    # ~/.scitoolkit/token and would otherwise see an opaque 401 from
+    # the backend.
+    _abort_if_stored_token_is_retired()
 
     token = auth.load_user_token()
     if token is None:
@@ -2312,6 +2364,13 @@ def publish(dry_run, allow_decrease):
     # The backend accepts both during the migration window; the CLI just
     # picks the per-user one when available.
     from . import auth as _auth
+
+    # Stale-token pre-flight (post-2026-05-15 rollover). Catches an
+    # sct_user_ token in ~/.scitoolkit/token before the upload hits
+    # the backend's 401. (The legacy per-toolkit fallback isn't
+    # affected — that's a separate deprecation track.)
+    _abort_if_stored_token_is_retired()
+
     token, source = _auth.load_token_for_publish(toolkit_name)
     if token is None:
         console.print(
