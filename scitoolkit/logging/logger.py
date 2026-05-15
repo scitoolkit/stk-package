@@ -128,6 +128,26 @@ class ToolLogger:
             self._prune_serve_log_if_oversized()
             self._write_serve_session_marker()
 
+    def enable_serve_log(self) -> None:
+        """Turn on serve.log mirroring on an already-constructed logger.
+
+        Needed because the global logger is a singleton: any caller that
+        invokes ``get_logger()`` without ``serve_log=True`` before
+        ``scitoolkit serve`` starts (e.g. project-discovery debug
+        logging) would otherwise lock the instance into
+        ``_serve_log_enabled=False`` for the rest of the process.
+        Idempotent: prune + session marker fire only on the first call.
+        """
+        with self._lock:
+            if self._serve_log_enabled:
+                return
+            self._serve_log_enabled = True
+        # Run prune + session marker outside the lock so we don't hold
+        # it during file IO. (The flag flip itself is the source of
+        # truth; the marker is best-effort.)
+        self._prune_serve_log_if_oversized()
+        self._write_serve_session_marker()
+
     def log_tool_start(self, toolkit: str, tool: str, args: Dict[str, Any]) -> str:
         """
         Log the start of a tool execution.
@@ -516,11 +536,15 @@ def get_logger(*, serve_log: bool = False) -> ToolLogger:
 
     Args:
         serve_log: pass True from inside ``scitoolkit serve`` to enable
-            writing tool calls and orchestrator events to ``serve.log`` in
-            addition to the daily files. The first caller to set this flag
-            wins; subsequent calls return the existing instance regardless.
-            (Serve is the only caller that should pass True, and it does so
-            once at startup.)
+            writing tool calls and orchestrator events to ``serve.log``
+            in addition to the daily files. If the singleton already
+            exists with ``serve_log`` off, calling with ``serve_log=True``
+            upgrades the existing instance (turns mirroring on in place)
+            rather than silently dropping the request. That matters
+            because callers like ``_log_project_discovered`` instantiate
+            the logger off the hot path during serve startup; if their
+            no-kwarg ``get_logger()`` wins the race, the orchestrator's
+            later ``get_logger(serve_log=True)`` must still take effect.
 
     Returns:
         ToolLogger instance (singleton)
@@ -528,4 +552,7 @@ def get_logger(*, serve_log: bool = False) -> ToolLogger:
     global _logger
     if _logger is None:
         _logger = ToolLogger(serve_log=serve_log)
+        return _logger
+    if serve_log:
+        _logger.enable_serve_log()
     return _logger

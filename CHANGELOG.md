@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.5.5] — 2026-05-15
+
+Bundle of three independent fixes: the urgent one closes GitHub issue #5 — `scitoolkit publish` now auto-registers a toolkit on the registry on first run instead of bailing out with an opaque 404, so a brand-new toolkit can be shipped with just `scitoolkit login` + `scitoolkit publish`. The two queue-clearing items: `scitoolkit init`'s misleading "registry" wording is fixed, and a `serve.log` wiring regression that left `~/.scitoolkit/logs/serve.log` empty during serve sessions is fixed and pinned with a test.
+
+### Added
+
+- **`scitoolkit publish` auto-registers on first publish (closes [#5](https://github.com/scitoolkit/stk-package/issues/5)).** When the pre-flight `GET /api/toolkits/<name>` returns 404, publish prompts the user — using `name`, `category`, `description`, and `version` from `toolkit.yaml` — then `POST`s `/api/toolkits` to register, and proceeds to upload. Flags: `--yes/-y` accepts the prompt non-interactively, `--no/-n` declines (publish aborts cleanly), `--no-input` accepts the prompt's default (Y) — same flag semantics as elsewhere. `scitoolkit create` stays for the name-reservation use case (register without uploading code yet); just no longer required. New helper `_publish_auto_register()` in `cli.py`.
+
+### Changed
+
+- **`scitoolkit init` wording no longer suggests it registers the toolkit.** The pre-flight registry check was misleading: "Toolkit not found in registry. Creating new template..." plus the green checkmark on the next line read as "init just created the registry row." It hadn't — init only ever scaffolds local files. New copy: "Checking if 'X' is already registered..." → "'X' is not yet on the registry — scaffolding a new local toolkit." → "✓ Local toolkit scaffold created at: ...". The success line now says "Local toolkit scaffold" instead of "Toolkit created" so the registration state can't be misread.
+- **`scitoolkit init` "Next steps" output reflects the new flow.** Drops the deprecated `stk login <toolkit>` form, drops the "Create the toolkit on https://scitoolkit.org" step entirely (publish auto-handles registration now), references `scitoolkit` rather than `stk` for canonical-form alignment.
+
+### Fixed
+
+- **`serve.log` wiring regression: log file no longer empty during serve sessions.** Root cause: the singleton `ToolLogger` was constructed with `serve_log=False` whenever `_log_project_discovered` (or any other early call site) invoked `get_logger()` before the orchestrator's `get_logger(serve_log=True)`. The "first caller wins" semantics dropped serve's later request silently. Fix: `get_logger(serve_log=True)` now *upgrades* an existing instance via the new `ToolLogger.enable_serve_log()` method (idempotent: prune + session marker fire exactly once). Defense in depth: `scitoolkit serve` claims the logger with `serve_log=True` before importing the orchestrator, so the upgrade path is normally not even needed.
+
+### Tests
+
+- New `tests/test_publish_auto_create.py` covers the auto-register flow: pre-flight 404 → prompt -y → POST 201 → upload 201 (happy path; asserts the create body matches `toolkit.yaml`), --no path (no POST), name-taken 409 (clear error), registration succeeds-upload-fails (registered-but-empty hint with "no need to register again"), 200 pre-flight (no auto-register path), missing-category-in-yaml (does not silently POST with empty fields).
+- New `tests/test_logger_serve_log_wiring.py` pins the singleton-upgrade fix: late `get_logger(serve_log=True)` upgrades an existing instance, writes the session marker on upgrade, idempotent on repeat upgrade calls, events after upgrade land in serve.log, events without upgrade do not.
+
+### Internal
+
+- `publish` now carries `@_interactive_options` (--yes/--no/--no-input). The flag set was already documented in the CLI's overall pattern; the publish command was the holdout.
+
+---
+
 ## [0.5.4] — 2026-05-15
 
 CLI-side completion of Backend's 2026-05-15 token-prefix rotation. The per-user CLI token prefix changed `sct_user_` → `stk_user_`; this release teaches the CLI to recognize the new prefix as canonical, reject the retired one at paste time, and short-circuit any authenticated command whose stored `~/.scitoolkit/token` still uses the old prefix — with a clear "run `scitoolkit logout && scitoolkit login`" message — *before* hitting the backend.

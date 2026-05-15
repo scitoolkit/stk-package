@@ -156,6 +156,154 @@ def _require_input(
     return click.prompt(label, hide_input=hide_input)
 
 
+def _publish_auto_register(
+    *,
+    toolkit_name: str,
+    version: str,
+    config: dict,
+    mode: str,
+) -> bool:
+    """Register a toolkit on the registry mid-publish (closes issue #5).
+
+    Called from ``publish`` when the pre-flight GET returned 404, i.e.
+    the toolkit name isn't yet registered. Prompts the user (using
+    metadata from toolkit.yaml), then POSTs to ``/api/toolkits`` so the
+    subsequent upload doesn't fail with an opaque 404.
+
+    Returns True if the toolkit was just registered (so the caller can
+    surface a "registered but empty" hint if the upload then fails),
+    or exits the process on user decline or registration failure.
+    Never returns False: success is the only non-exit code path.
+    """
+    import requests
+    from . import auth as _auth
+
+    category = (config.get("category") or "").strip()
+    description = (config.get("description") or "").strip()
+
+    if not category:
+        console.print(
+            f"[red]✗ Cannot auto-register '{toolkit_name}': "
+            "toolkit.yaml is missing a 'category' field.[/red]"
+        )
+        console.print(
+            "Add e.g. [cyan]category: other[/cyan] to toolkit.yaml "
+            "(allowed: astro, hep, quantum, bio, chem, materials, "
+            "utils, other), or run [cyan]scitoolkit create[/cyan] "
+            "explicitly."
+        )
+        sys.exit(1)
+    if not description:
+        console.print(
+            f"[red]✗ Cannot auto-register '{toolkit_name}': "
+            "toolkit.yaml is missing a 'description' field.[/red]"
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[yellow]✗ Toolkit '{toolkit_name}' is not yet registered on "
+        "this registry.[/yellow]\n"
+    )
+    console.print(
+        f"Register and publish v{version} under your account?"
+    )
+    console.print(f"  Name:        [cyan]{toolkit_name}[/cyan]")
+    console.print(f"  Category:    [cyan]{category}[/cyan]")
+    console.print(f"  Description: [cyan]{description}[/cyan]")
+    console.print()
+
+    approved = _confirm(
+        f"Register '{toolkit_name}' on the registry?",
+        default=True,
+        mode=mode,
+        consequential=False,
+    )
+    if not approved:
+        console.print(
+            "[yellow]Registration declined; nothing published.[/yellow]"
+        )
+        console.print(
+            "Use [cyan]scitoolkit create[/cyan] to register the name "
+            "without uploading, or re-run [cyan]scitoolkit publish[/cyan] "
+            "and accept the prompt."
+        )
+        sys.exit(1)
+
+    # Auth required for registration. Reuse the publish stale-token
+    # pre-flight here so the user gets a clear message before any
+    # HTTP hits the backend.
+    _abort_if_stored_token_is_retired()
+
+    token = _auth.load_user_token()
+    if not token:
+        console.print(
+            "[red]✗ Not logged in.[/red] Run [cyan]scitoolkit login[/cyan] "
+            "first, then re-run [cyan]scitoolkit publish[/cyan]."
+        )
+        sys.exit(1)
+
+    api_url = os.environ.get(
+        "SCITOOLKIT_API_URL", "https://api.scitoolkit.org",
+    )
+    create_url = f"{api_url}/api/toolkits"
+    body = {
+        "name": toolkit_name,
+        "category": category,
+        "description": description,
+        "version": version,
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+
+    console.print(
+        f"Registering [cyan]{toolkit_name}[/cyan] on the registry..."
+    )
+    try:
+        r = requests.post(create_url, json=body, headers=headers, timeout=15)
+    except requests.exceptions.RequestException as e:
+        console.print(
+            f"[red]✗ Could not reach registry to register: {e}[/red]"
+        )
+        sys.exit(1)
+
+    if r.status_code == 401:
+        console.print(
+            "[red]✗ Token rejected by registry.[/red] Run "
+            "[cyan]scitoolkit login[/cyan] to refresh, then re-run "
+            "[cyan]scitoolkit publish[/cyan]."
+        )
+        sys.exit(1)
+    if r.status_code == 409:
+        console.print(
+            f"[red]✗ Toolkit name '{toolkit_name}' is already taken by "
+            "another account.[/red]"
+        )
+        console.print(
+            "Choose a different name in [cyan]toolkit.yaml[/cyan]."
+        )
+        sys.exit(1)
+    if r.status_code == 422:
+        try:
+            details = r.json().get("detail", "")
+        except Exception:
+            details = r.text
+        console.print(
+            f"[red]✗ Registry rejected the registration:[/red]\n  {details}"
+        )
+        sys.exit(1)
+    if not (200 <= r.status_code < 300):
+        console.print(
+            f"[red]✗ Registration failed (HTTP {r.status_code}): "
+            f"{r.text[:200]}[/red]"
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[bold green]✓[/bold green] Registered toolkit "
+        f"[cyan]{toolkit_name}[/cyan].\n"
+    )
+    return True
+
+
 def _abort_if_stored_token_is_retired() -> None:
     """Pre-flight check: short-circuit if ``~/.scitoolkit/token`` is stale.
 
@@ -236,7 +384,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.4", prog_name="scitoolkit")
+@click.version_option(version="0.5.5", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -696,12 +844,16 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
             ))
         name = _require_input("Toolkit name", mode=mode, bypass_flag="NAME (positional argument)")
 
-    # Check if toolkit exists in registry
+    # Check if a toolkit by this name is already registered. This is
+    # only a name-collision warning: `init` always scaffolds local files
+    # regardless. If the name *is* registered (and we have access),
+    # we pre-fill toolkit.yaml from the registry's metadata so the user
+    # doesn't have to re-type fields they've already set.
     api_url = "https://api.scitoolkit.org"
     registry_metadata = None
 
     try:
-        console.print(f"Checking if '{name}' exists in registry...")
+        console.print(f"Checking if '{name}' is already registered...")
         response = requests.get(f"{api_url}/api/toolkits/{name}", timeout=5)
 
         if response.status_code == 200:
@@ -710,12 +862,15 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
             console.print(f"[green]✓ Found {name} in registry (v{latest_version})[/green]")
             console.print("Pre-filling metadata from registry...")
         elif response.status_code == 404:
-            console.print(f"[dim]Toolkit not found in registry. Creating new template...[/dim]")
+            console.print(
+                f"[dim]'{name}' is not yet on the registry — "
+                "scaffolding a new local toolkit.[/dim]"
+            )
         else:
             console.print(f"[yellow]Could not check registry (status {response.status_code})[/yellow]")
     except requests.exceptions.RequestException as e:
         console.print(f"[yellow]Could not connect to registry: {e}[/yellow]")
-        console.print("Creating new template...")
+        console.print("Scaffolding a new local toolkit...")
 
     # ``--path`` is the *parent directory* in which to create the new
     # toolkit dir; the toolkit's own name is always appended. Matches
@@ -740,24 +895,29 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
         if display_path.startswith(home):
             display_path = "~" + display_path[len(home):]
         console.print(
-            f"\n[bold green]✓[/bold green] Toolkit created at: [cyan]{display_path}[/cyan]"
+            f"\n[bold green]✓[/bold green] Local toolkit scaffold created "
+            f"at: [cyan]{display_path}[/cyan]"
         )
 
         if registry_metadata:
             console.print("\n[bold]Next steps:[/bold]")
             console.print(f"  1. cd {display_path}")
             console.print("  2. Add your tools in the tools/ directory")
-            console.print("  3. Run [cyan]stk validate[/cyan]")
-            console.print(f"  4. Run [cyan]stk login {name}[/cyan] with your token")
-            console.print("  5. Run [cyan]stk publish[/cyan]")
+            console.print("  3. Run [cyan]scitoolkit validate[/cyan]")
+            console.print("  4. Run [cyan]scitoolkit login[/cyan] (browser flow)")
+            console.print("  5. Run [cyan]scitoolkit publish[/cyan]")
         else:
             console.print("\n[bold]Next steps:[/bold]")
             console.print(f"  1. cd {display_path}")
-            console.print("  2. Create the toolkit on https://scitoolkit.org")
-            console.print("  3. Edit toolkit.yaml with your details")
-            console.print("  4. Add your tools in the tools/ directory")
-            console.print(f"  5. Run [cyan]stk login {name}[/cyan]")
-            console.print("  6. Run [cyan]stk validate[/cyan] and then [cyan]stk publish[/cyan]")
+            console.print("  2. Edit toolkit.yaml (name, description, author, category)")
+            console.print("  3. Add your tools in the tools/ directory")
+            console.print("  4. Run [cyan]scitoolkit validate[/cyan]")
+            console.print("  5. Run [cyan]scitoolkit login[/cyan] (browser flow, one-time)")
+            console.print(
+                "  6. Run [cyan]scitoolkit publish[/cyan] "
+                "(auto-registers '{0}' on the registry on first run)"
+                .format(name)
+            )
 
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Error creating toolkit: {e}", style="red")
@@ -2193,26 +2353,34 @@ def setup(toolkit_name, reset, check, yes, no_, no_input):
         'should bump the version forward.'
     ),
 )
-def publish(dry_run, allow_decrease):
+@_interactive_options
+def publish(dry_run, allow_decrease, yes, no_, no_input):
     """
     Publish toolkit to the SciToolkit registry.
 
     Packages the current directory as a tarball and uploads it. Requires
-    a valid toolkit token stored via stk login <name>.
+    authentication via `scitoolkit login`. If the toolkit name has not
+    yet been registered on the registry, prompts to register it on the
+    spot (using metadata from toolkit.yaml), then uploads — so a brand-
+    new toolkit can be shipped with just `scitoolkit login` + `scitoolkit
+    publish`. Use `scitoolkit create` explicitly if you want to reserve
+    a name without uploading code yet.
 
     \b
     Lifecycle:
         stk validate                 # check structure
-        stk login <name>             # one-time, stores token
+        stk login                    # one-time, stores user token
         stk publish --dry-run        # local sanity check
-        stk publish                  # ship it
+        stk publish                  # ship it (auto-registers on first run)
 
     \b
     Examples:
         stk publish
         stk publish --dry-run
+        stk publish -y               # auto-accept the registration prompt
         stk publish --allow-version-decrease   # rare; emergency rollbacks
     """
+    mode = _resolve_prompt_mode(yes, no_, no_input)
     console.print("\n[bold blue]Publishing toolkit to SciToolkit registry...[/bold blue]\n")
 
     # Step 1: Find and read toolkit.yaml
@@ -2259,6 +2427,12 @@ def publish(dry_run, allow_decrease):
     # version, and accidentally regressing the version number. Skip for
     # --dry-run (offline) and when the user explicitly asked for a
     # decrease via --allow-version-decrease.
+    #
+    # Side benefit: this GET also tells us whether the toolkit is
+    # registered at all. A 404 here means "name not yet on the
+    # registry"; we record that and chain a `POST /api/toolkits`
+    # later, after building the tarball (Step 2c2).
+    needs_registration = False
     if not dry_run:
         from .versioning import is_strictly_greater, max_version, suggest_next_version
         api_url_check = "https://api.scitoolkit.org"
@@ -2268,6 +2442,8 @@ def publish(dry_run, allow_decrease):
             )
         except requests.exceptions.RequestException:
             r = None
+        if r is not None and r.status_code == 404:
+            needs_registration = True
         if r is not None and r.status_code == 200:
             try:
                 tk_meta = r.json()
@@ -2330,6 +2506,22 @@ def publish(dry_run, allow_decrease):
         # If the request failed or returned non-200, fall through silently.
         # The registry itself is the final authority — it will reject on
         # upload if there's a real conflict.
+
+    # Step 2c: Auto-register on first publish (closes issue #5).
+    #
+    # When the version pre-flight GET returned 404, the toolkit name
+    # isn't yet registered. Prompt the user, then POST /api/toolkits
+    # with metadata from toolkit.yaml so we don't bail out at upload
+    # time with an opaque 404. Done before the tarball build so a
+    # decline ("n") or registration collision (409) doesn't waste work.
+    was_just_registered = False
+    if needs_registration:
+        was_just_registered = _publish_auto_register(
+            toolkit_name=toolkit_name,
+            version=version,
+            config=config,
+            mode=mode,
+        )
 
     # Step 3: Create tarball. We do this before reading the token so that
     # `--dry-run` (whose whole purpose is "test the package without
@@ -2493,16 +2685,29 @@ def publish(dry_run, allow_decrease):
             try:
                 error = response.json()
                 error_msg = error.get('detail', 'Unknown error')
-            except:
+            except Exception:
                 error_msg = response.text or 'Unknown error'
 
             console.print(f"\n[red]✗ Upload failed: {error_msg}[/red]")
             console.print(f"Status code: {response.status_code}")
+            if was_just_registered:
+                console.print(
+                    f"[yellow]The toolkit '{toolkit_name}' was just "
+                    "registered.[/yellow] Fix the issue and re-run "
+                    "[cyan]scitoolkit publish[/cyan] (no need to register "
+                    "again)."
+                )
             sys.exit(1)
 
     except requests.exceptions.RequestException as e:
         console.print(f"\n[red]✗ Network error: {e}[/red]")
         console.print("Please check your internet connection and try again.")
+        if was_just_registered:
+            console.print(
+                f"[yellow]The toolkit '{toolkit_name}' was just "
+                "registered.[/yellow] Re-run [cyan]scitoolkit publish[/cyan] "
+                "once the network is back (no need to register again)."
+            )
         sys.exit(1)
     except Exception as e:
         console.print(f"\n[red]✗ Unexpected error: {e}[/red]")
@@ -4160,6 +4365,15 @@ def serve(ctx, toolkits_flag, group_name, enable_tool, disable_tool, enable_grou
         SERVE_CONFIG_PATH,
     )
     from .serve.orchestrator import discover_toolkits, serve as _serve_entry
+
+    # Claim serve.log mirroring before anything else can take the
+    # singleton. Project-discovery during ``discover_toolkits`` calls
+    # ``get_logger()`` with no kwarg and would otherwise lock the
+    # logger into ``serve_log=False`` for the rest of the process.
+    # The orchestrator also calls ``get_logger(serve_log=True)`` later;
+    # it's idempotent.
+    from .logging.logger import get_logger as _get_logger
+    _get_logger(serve_log=True)
 
     try:
         cfg = load_serve_config()
