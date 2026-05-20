@@ -15,8 +15,11 @@ dependency conflicts between toolkits are never a problem.
 ```bash
 pip install scitoolkit
 
-# Install a toolkit from the registry
+# Install a toolkit from the registry (global by default)
 stk install arxiv-search
+
+# Or scope an install to the current project's manifest
+stk install -l arxiv-search
 
 # See what you have
 stk list
@@ -27,6 +30,12 @@ stk serve
 
 `stk` is a shorter alias for `scitoolkit`; both ship with the package
 and behave identically.
+
+Installs are global by default (`-g`). Use `-l` to pin a toolkit into
+the current project's `.scitoolkit/manifest.yaml` instead — the binary
+still lives in the shared global cache, only the pin is project-scoped,
+so a collaborator who clones the project and runs `stk install` (no
+args) gets the same toolkits at the same versions.
 
 To use the served toolkits in [Claude Code](https://claude.ai/code), add
 this to its MCP config:
@@ -57,13 +66,33 @@ cd my-toolkit
 # write your tools in tools/ ; write skills in skills/
 stk validate                     # check structure
 stk login                        # one-time, browser-flow auth (per-user)
-stk publish                      # ship it
+stk publish                      # ship it (auto-registers on first run)
 ```
+
+`stk publish` registers the toolkit on the registry on its first run —
+no separate step. If the name isn't registered yet, it prompts you
+(using the metadata in `toolkit.yaml`) and registers it before
+uploading. `stk create` is still available if you want to reserve a
+name without uploading code yet, but it's no longer required.
 
 `stk login` (no toolkit name) does a browser-flow that gives you a
 per-user token good for any toolkit you own or collaborate on. Legacy
 per-toolkit tokens are still accepted (`stk login my-toolkit`) but
 deprecated.
+
+**Iterating locally.** To develop a toolkit's code without a
+publish→install round-trip on every change, install it editable:
+
+```bash
+cd my-toolkit
+stk install -e .                 # live symlink to this source dir
+stk serve my-toolkit             # serve it; edit tools/, restart, edits are live
+```
+
+An editable install symlinks your source into the cache and builds the
+environment there (your source tree stays clean — no `.venv` written
+into it). Edits to your tool source appear on the next `stk serve`. If
+you change dependencies, re-run `stk install -e .` to rebuild the env.
 
 For the agent-assisted authoring flow (recommended for first toolkits),
 see <https://scitoolkit.org/docs/scaffold-with-an-agent>.
@@ -75,13 +104,15 @@ groups, expected_toolkits, configuration — see
 
 ---
 
-## What's in scitoolkit 0.3.0
+## What's in scitoolkit 0.6.0
 
 **Commands:**
 
-- `init`, `validate`, `login`, `whoami`, `logout`, `publish` — author
-  and ship toolkits.
+- `init`, `create`, `ingest`, `validate`, `login`, `whoami`, `logout`,
+  `publish` — author and ship toolkits.
 - `search`, `install`, `uninstall`, `list` — manage installed toolkits.
+  `install` takes `-g` (global, the default), `-l` (pin into this
+  project), or `-e <path>` (editable, live symlink to a local source).
 - `serve` — run installed toolkits as an MCP stdio server. Supports
   positional toolkit names, `--group`, `--enable-tool`,
   `--disable-tool`, `--dry-run`, `--call-timeout`.
@@ -93,6 +124,16 @@ groups, expected_toolkits, configuration — see
 
 **Features:**
 
+- **Editable installs.** `stk install -e <path>` symlinks a local
+  toolkit source into the cache so `serve` loads tools live — the
+  `pip install -e .` parallel for the toolkit dev loop. The env is
+  built and cached; only the source is symlinked, so your source tree
+  stays clean.
+- **Multi-version installs + per-project pinning.** Different versions
+  of a toolkit coexist in the global cache; each project pins which
+  version it uses in a git-committed `.scitoolkit/manifest.yaml`. The
+  binary lives once in the shared cache (`-g`/`-l` choose the manifest
+  scope, not the file location).
 - **Configuration system.** Toolkits declare a `config:` block in
   `toolkit.yaml` (seven types: `string`, `secret`, `path`, `integer`,
   `float`, `boolean`, `choice`); users fill it at install time or by
