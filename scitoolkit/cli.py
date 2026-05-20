@@ -384,7 +384,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.6.0", prog_name="scitoolkit")
+@click.version_option(version="0.6.1", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -924,6 +924,86 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
         sys.exit(1)
 
 
+def _print_dropped_warning(dropped, root: Path) -> None:
+    """Loud stderr warning about files whose module path didn't resolve."""
+    if not dropped:
+        return
+    err_console = Console(stderr=True)
+    n = len(dropped)
+    err_console.print(
+        f"\n[bold yellow]WARNING:[/bold yellow] {n} file(s) contained "
+        "tool definitions but were skipped because their module "
+        "path could not be resolved:"
+    )
+    for d in dropped:
+        try:
+            rel_str = str(d.source_path.relative_to(root))
+        except ValueError:
+            rel_str = str(d.source_path)
+        err_console.print(
+            f"  [yellow]{rel_str}[/yellow]  ([dim]{d.reason}[/dim])"
+        )
+    err_console.print(
+        "[dim]Add the missing __init__.py file(s) and re-run "
+        "scitoolkit ingest to include these tools.[/dim]"
+    )
+
+
+def _print_merge_summary(result) -> None:
+    """Render the merge-mode summary (add + report, never auto-remove)."""
+    m = result.merge
+    root = result.target.parent
+
+    if not result.wrote and not m.added and not m.stale:
+        console.print(
+            "\n[green]No changes[/green] — toolkit.yaml already matches "
+            "source."
+        )
+        _print_dropped_warning(result.dropped, root)
+        return
+
+    console.print("\n[bold green]Merge complete[/bold green]"
+                  + (" (toolkit.yaml updated)." if result.wrote else "."))
+
+    if m.added:
+        names = ", ".join(f"{t.name} ({t.module})" for t in m.added)
+        console.print(
+            f"  [green]+[/green] {len(m.added)} new tool"
+            f"{'s' if len(m.added) != 1 else ''} added (ungrouped): {names}"
+        )
+    console.print(
+        f"  {m.preserved_count} existing entr"
+        f"{'ies' if m.preserved_count != 1 else 'y'} preserved."
+    )
+    if m.pruned:
+        names = ", ".join(f"{name} ({mod})" for mod, name in m.pruned)
+        console.print(
+            f"  [yellow]-[/yellow] {len(m.pruned)} stale entr"
+            f"{'ies' if len(m.pruned) != 1 else 'y'} pruned: {names}"
+        )
+    elif m.stale:
+        for mod, name in m.stale:
+            console.print(
+                f"  [yellow]![/yellow] yaml entry's source no longer "
+                f"found: {name} ({mod})"
+            )
+        console.print(
+            "    [dim](use --prune to remove, or if it was renamed, "
+            "re-add the group:/description: by hand)[/dim]"
+        )
+
+    _print_dropped_warning(result.dropped, root)
+
+    if m.added or m.stale:
+        console.print("\n[bold]Next steps:[/bold]")
+        if m.added:
+            console.print(
+                "  - Assign [cyan]group:[/cyan] to the new tools if you "
+                "want tool_groups gating."
+            )
+        console.print("  - Run [cyan]scitoolkit validate[/cyan].")
+
+
 @main.command()
 @click.argument(
     "path",
@@ -939,32 +1019,57 @@ def init(name, path, with_docker, with_setup, yes, no_, no_input):
 )
 @click.option(
     "--force", is_flag=True,
-    help="Overwrite an existing toolkit.yaml without prompting.",
+    help=(
+        "Overwrite an existing toolkit.yaml from scratch, ignoring its "
+        "current contents. Without --force, re-running over an existing "
+        "toolkit.yaml merges (see below)."
+    ),
+)
+@click.option(
+    "--prune", is_flag=True,
+    help=(
+        "In merge mode, remove tools: entries whose source is no longer "
+        "found (after confirmation). Default is to warn but keep them."
+    ),
 )
 @click.option(
     "--dry-run", is_flag=True,
     help="Print discovered tools and the target path; don't write.",
 )
 @_interactive_options
-def ingest(path, output, force, dry_run, yes, no_, no_input):
+def ingest(path, output, force, prune, dry_run, yes, no_, no_input):
     """
-    Generate a toolkit.yaml from an existing codebase.
+    Generate or re-sync a toolkit.yaml from an existing codebase.
 
     Walks the given directory (default: cwd), discovers tools via
-    @define_tool decorators and BaseTool subclass detection, and
-    writes a toolkit.yaml skeleton with explicit import paths. Pure
+    @define_tool decorators and BaseTool subclass detection. Pure
     static analysis — never imports the modules being scanned.
 
-    Use this to onboard an existing scientific codebase as a
-    scitoolkit toolkit without restructuring or copy-pasting code.
+    \b
+    Two modes, auto-detected by whether a toolkit.yaml already exists:
+      - No toolkit.yaml  -> scaffold a fresh one from the discovered tools.
+      - Existing yaml    -> MERGE: append newly-discovered tools to the
+                            tools: list (ungrouped), leave existing entries
+                            byte-for-byte untouched (custom description:,
+                            group:, ordering, comments all preserved), and
+                            report any entries whose source vanished. Only
+                            the tools: list is touched — metadata, config:,
+                            and tool_groups: are never modified.
+      - --force          -> overwrite the yaml from scratch (escape hatch).
 
-    Example:
-        cd ~/code/heptapod
-        scitoolkit ingest
+    Use --prune to actually remove stale entries in merge mode (default
+    is to warn). The merge is a no-op (file untouched) when source and
+    yaml already agree.
+
+    \b
+    Example (the local dev loop):
+        scitoolkit install -e .     # editable install
+        # ... add a new @define_tool ...
+        scitoolkit ingest           # merge it into toolkit.yaml
+        scitoolkit serve            # use it
 
     The author's code stays where it is. The emitted yaml lists each
-    tool by import path. Edit the metadata fields, write
-    requirements.txt, then run scitoolkit validate and publish.
+    tool by import path.
     """
     from .ingest import ingest as run_ingest
 
@@ -976,20 +1081,26 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
 
     mode = _resolve_prompt_mode(yes, no_, no_input)
 
-    # Decide overwrite policy.
-    overwrite = bool(force or yes)
     existing_at_target = target.is_file()
-    if existing_at_target and not overwrite and not dry_run:
-        rel = target if not target.is_relative_to(root) else target.relative_to(root)
-        question = f"toolkit.yaml exists at {rel}. Overwrite?"
+
+    # --force is the only path that overwrites from scratch. Without it,
+    # an existing toolkit.yaml triggers MERGE mode (non-destructive),
+    # not the old overwrite prompt — re-running ingest to pick up new
+    # tools is the common case and shouldn't threaten the user's work.
+    overwrite = bool(force)
+
+    # --prune confirmation. Removing yaml entries is destructive (a
+    # temporarily-commented-out tool could be pruned), so confirm unless
+    # the user passed --yes / a non-interactive default.
+    effective_prune = prune
+    if prune and existing_at_target and not force and not dry_run:
         approved = _confirm(
-            question,
+            "Remove tools: entries whose source is no longer found?",
             mode=mode,
             default=False,
             consequential=True,
         )
-        if approved:
-            overwrite = True
+        effective_prune = approved
 
     try:
         result = run_ingest(
@@ -997,19 +1108,10 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
             output=output if output else None,
             overwrite=overwrite,
             dry_run=dry_run,
+            prune=effective_prune,
         )
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Ingest failed: {e}", style="red")
-        sys.exit(1)
-
-    # Refuse-to-overwrite path.
-    if result.overwrite_blocked:
-        console.print(
-            f"[bold red]✗[/bold red] toolkit.yaml exists at "
-            f"{result.target}; refusing to overwrite. "
-            "Re-run with --force or --yes to replace it.",
-            style="red",
-        )
         sys.exit(1)
 
     # Summary output.
@@ -1040,6 +1142,13 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
         )
         return
 
+    # Merge-mode summary. Distinct from scaffold/overwrite: report what
+    # was added, preserved, and what's stale, without rewriting on a
+    # no-op.
+    if result.merged and result.merge is not None:
+        _print_merge_summary(result)
+        return
+
     if result.wrote:
         console.print(f"\n[bold green]✓[/bold green] Wrote {result.target}.")
 
@@ -1047,27 +1156,7 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
     # couldn't be resolved. Silent-drop here used to mean the author
     # shipped a confidently-wrong toolkit.yaml; see issue #1. Goes to
     # stderr so machine-readable consumers can pipe through.
-    if result.dropped:
-        err_console = Console(stderr=True)
-        n = len(result.dropped)
-        err_console.print(
-            f"\n[bold yellow]WARNING:[/bold yellow] {n} file(s) contained "
-            "tool definitions but were skipped because their module "
-            "path could not be resolved:"
-        )
-        for d in result.dropped:
-            try:
-                rel = d.source_path.relative_to(root)
-                rel_str = str(rel)
-            except ValueError:
-                rel_str = str(d.source_path)
-            err_console.print(
-                f"  [yellow]{rel_str}[/yellow]  ([dim]{d.reason}[/dim])"
-            )
-        err_console.print(
-            "[dim]Add the missing __init__.py file(s) and re-run "
-            "scitoolkit ingest to include these tools.[/dim]"
-        )
+    _print_dropped_warning(result.dropped, root)
 
     if not result.requirements_present:
         console.print(
@@ -1085,24 +1174,19 @@ def ingest(path, output, force, dry_run, yes, no_, no_input):
             "Python dependencies."
         )
     console.print("  - Run [cyan]scitoolkit validate[/cyan].")
-    # New-toolkit names must be registered on the registry before
-    # publish will work (404 otherwise). Mention both the CLI flow
-    # and the web UI; ingest's audience is onboarding existing
-    # codebases, so the registration step is just as relevant as for
-    # `scitoolkit init`. See issue #4.
-    console.print(
-        "  - Register the toolkit (skip if already registered). Either:"
-    )
-    console.print(
-        "      [cyan]scitoolkit create <name> --category <cat> "
-        "--description \"...\"[/cyan]"
-    )
-    console.print(
-        "    or create it via the web UI at "
-        "[cyan]https://scitoolkit.org[/cyan]."
-    )
-    console.print("  - Run [cyan]scitoolkit login[/cyan].")
+    console.print("  - Run [cyan]scitoolkit login[/cyan] (one-time).")
     console.print("  - Run [cyan]scitoolkit publish[/cyan].")
+    # Registration is no longer a required separate step: publish
+    # auto-registers an unregistered toolkit on first upload (with a
+    # prompt) as of 0.5.5. `scitoolkit create` and the web UI remain
+    # available for pre-registering a name without uploading. See
+    # issue #4 / issue #5.
+    console.print(
+        "    [dim](If the toolkit isn't registered yet, publish will offer "
+        "to register it. To reserve the name first, use "
+        "[/dim][cyan]scitoolkit create[/cyan][dim] or "
+        "[/dim][cyan]https://scitoolkit.org[/cyan][dim].)[/dim]"
+    )
 
 
 @main.command()

@@ -617,22 +617,38 @@ def _build_yaml_data(
     return data
 
 
+def _make_yaml():
+    """A ruamel YAML configured to match the project's emission style."""
+    from ruamel.yaml import YAML
+
+    yaml = YAML()
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.preserve_quotes = True
+    return yaml
+
+
+def _dump_yaml(data, target: Path) -> None:
+    """Dump an already-built ruamel mapping to ``target`` verbatim.
+
+    Used by merge mode, which mutates the loaded mapping in place
+    (preserving comments and untouched entries) rather than rebuilding
+    the tools list. Distinct from ``emit_toolkit_yaml``, which
+    *constructs* a fresh tools list from descriptors.
+    """
+    yaml = _make_yaml()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+
+
 def emit_toolkit_yaml(
     tools: Sequence[ToolDescriptor],
     target: Path,
     existing: Optional[dict] = None,
 ) -> None:
     """Write ``toolkit.yaml`` at ``target`` using ruamel.yaml."""
-    from ruamel.yaml import YAML
-
-    yaml = YAML()
-    yaml.indent(mapping=2, sequence=4, offset=2)
-    yaml.preserve_quotes = True
-
     data = _build_yaml_data(tools, existing)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8") as f:
-        yaml.dump(data, f)
+    _dump_yaml(data, target)
 
 
 def load_existing_yaml(target: Path) -> Optional[dict]:
@@ -651,6 +667,146 @@ def load_existing_yaml(target: Path) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
     return data
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Merge mode: re-sync an existing toolkit.yaml against source
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class MergeOutcome:
+    """What a merge changed (or would change).
+
+    ``added`` are discovered tools absent from the yaml (appended,
+    ungrouped). ``stale`` are yaml entries whose source was not found in
+    the scan ((module, name) tuples). ``preserved_count`` is how many
+    existing entries were left byte-for-byte untouched. ``changed`` is
+    True iff the file should be rewritten (something was added, or
+    pruned). A pure no-op (no adds, and either no stale or stale left
+    in place) sets ``changed=False`` so the caller can skip the write.
+    """
+
+    added: List[ToolDescriptor] = field(default_factory=list)
+    stale: List[Tuple[str, str]] = field(default_factory=list)
+    preserved_count: int = 0
+    pruned: List[Tuple[str, str]] = field(default_factory=list)
+    changed: bool = False
+
+
+def _entry_key(entry) -> Optional[Tuple[str, str]]:
+    """Extract the (module, name) key from a yaml tools[] entry.
+
+    Entries are expected to be mappings with ``module`` and ``name``.
+    Returns None for a malformed entry (e.g. a bare string) so the merge
+    leaves it untouched rather than crashing.
+    """
+    if not isinstance(entry, dict):
+        return None
+    module = entry.get("module")
+    name = entry.get("name")
+    if module is None or name is None:
+        return None
+    return (str(module), str(name))
+
+
+def merge_tools_into_existing(
+    existing: dict,
+    discovered: Sequence[ToolDescriptor],
+    *,
+    prune: bool,
+) -> MergeOutcome:
+    """Merge discovered tools into an existing yaml mapping in place.
+
+    Keyed on (``module``, ``name``). Matched entries are left completely
+    untouched — custom ``description:``, ``group:``, ordering, and
+    comments all survive because we mutate the existing ruamel
+    ``CommentedSeq`` rather than rebuilding it. New tools (in source,
+    absent from the yaml) are appended at the end, ungrouped. Stale
+    entries (in the yaml, source not found) are reported; with
+    ``prune=True`` they're removed from the sequence.
+
+    Returns a :class:`MergeOutcome`. The ``existing`` mapping is mutated
+    only when there's a real change (append and/or prune); a pure no-op
+    leaves it untouched so the caller can avoid a spurious rewrite.
+    """
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+
+    tools_seq = existing.get("tools")
+    # Normalize: if there's no tools: key or it isn't a sequence, treat
+    # the existing set as empty (everything discovered is "new"). We
+    # still preserve the rest of the mapping untouched.
+    if not isinstance(tools_seq, (list, CommentedSeq)):
+        tools_seq = CommentedSeq()
+        attach_seq = True
+    else:
+        attach_seq = False
+
+    existing_keys = set()
+    for entry in tools_seq:
+        key = _entry_key(entry)
+        if key is not None:
+            existing_keys.add(key)
+
+    discovered_keys = {(t.module, t.name) for t in discovered}
+
+    # New = discovered but not already in the yaml. Preserve discovery
+    # order for deterministic, readable appends.
+    added: List[ToolDescriptor] = [
+        t for t in discovered if (t.module, t.name) not in existing_keys
+    ]
+
+    # Stale = in the yaml but not discovered in source.
+    stale: List[Tuple[str, str]] = [
+        key for key in (
+            _entry_key(e) for e in tools_seq
+        ) if key is not None and key not in discovered_keys
+    ]
+
+    outcome = MergeOutcome(
+        added=added,
+        stale=stale,
+        preserved_count=len(existing_keys),
+    )
+
+    will_prune = prune and bool(stale)
+    if not added and not will_prune:
+        # Pure no-op. Don't mutate; caller skips the write.
+        outcome.changed = False
+        return outcome
+
+    # Prune first (so preserved_count reflects what remains, and the
+    # append lands at the true end).
+    if will_prune:
+        stale_set = set(stale)
+        keep = CommentedSeq()
+        for entry in tools_seq:
+            key = _entry_key(entry)
+            if key is not None and key in stale_set:
+                continue
+            keep.append(entry)
+        outcome.pruned = list(stale)
+        outcome.preserved_count = len(
+            [e for e in keep if _entry_key(e) is not None]
+        )
+        # Replace the sequence contents in place to keep it attached to
+        # the parent mapping with its comment anchors.
+        tools_seq = keep
+        attach_seq = True
+
+    # Append new tools, ungrouped (module/name/description only).
+    for t in added:
+        entry = CommentedMap()
+        entry["module"] = t.module
+        entry["name"] = t.name
+        entry["description"] = t.description
+        tools_seq.append(entry)
+
+    if attach_seq:
+        existing["tools"] = tools_seq
+
+    outcome.changed = True
+    return outcome
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -676,6 +832,12 @@ class IngestResult:
     requirements_present: bool
     overwrite_blocked: bool = False
     dropped: List[DroppedFile] = field(default_factory=list)
+    # Merge mode (re-ingest over an existing toolkit.yaml). ``merged`` is
+    # True when the run took the merge path (existing yaml, no --force);
+    # ``merge`` carries what changed. In scaffold / --force mode these
+    # stay False / None.
+    merged: bool = False
+    merge: Optional[MergeOutcome] = None
 
 
 def ingest(
@@ -684,13 +846,23 @@ def ingest(
     *,
     overwrite: bool,
     dry_run: bool,
+    prune: bool = False,
 ) -> IngestResult:
     """Discover tools and write toolkit.yaml.
 
-    ``overwrite`` controls whether an existing ``toolkit.yaml`` at
-    ``output`` should be replaced. The CLI layer is responsible for
-    deriving this from ``--force``/prompt-mode/TTY status; this function
-    treats it as a binary input.
+    Three modes, all driven by inputs the CLI derives:
+
+    - **Scaffold** — no existing ``toolkit.yaml`` at the target. Writes
+      a fresh skeleton (today's behavior).
+    - **Merge** — an existing ``toolkit.yaml`` and ``overwrite=False``.
+      Re-syncs the ``tools:`` list against source, keyed on
+      (module, name): matched entries are left byte-for-byte untouched,
+      new tools appended ungrouped, stale entries reported (and removed
+      iff ``prune=True``). No-op when nothing changed (file not
+      rewritten). Only the ``tools:`` array is touched.
+    - **Overwrite** — an existing yaml and ``overwrite=True`` (the
+      CLI's ``--force`` / confirmed-overwrite path). Rebuilds from
+      scratch, preserving non-``tools`` keys.
 
     On ``dry_run`` no file is written; descriptors and target path are
     returned for the CLI to print.
@@ -710,16 +882,27 @@ def ingest(
         )
 
     existing = load_existing_yaml(target)
+
+    # Merge mode: existing yaml + not a forced overwrite. Re-sync the
+    # tools list without clobbering hand-edits.
     if existing is not None and not overwrite:
+        outcome = merge_tools_into_existing(existing, tools, prune=prune)
+        wrote = False
+        if outcome.changed:
+            _dump_yaml(existing, target)
+            wrote = True
         return IngestResult(
             tools=tools,
             target=target,
-            wrote=False,
+            wrote=wrote,
             requirements_present=requirements_present,
-            overwrite_blocked=True,
             dropped=dropped,
+            merged=True,
+            merge=outcome,
         )
 
+    # Scaffold (no existing) or forced overwrite: rebuild from scratch,
+    # preserving non-tools keys when an existing yaml is present.
     emit_toolkit_yaml(tools, target, existing=existing)
     return IngestResult(
         tools=tools,

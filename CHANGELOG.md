@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.6.1] — 2026-05-20
+
+`scitoolkit ingest` can now re-sync an existing toolkit.yaml against source instead of only scaffolding from scratch — the back half of the local dev loop (`install -e .` → write tools → `ingest` to register them → `serve`). Also folds in the ingest Next-steps banner simplification and carries the refreshed README to PyPI.
+
+### Added
+
+- **`scitoolkit ingest` merge mode.** Re-running `ingest` over a directory that already has a `toolkit.yaml` now MERGES rather than refusing or overwriting. The reconciliation is keyed on (`module`, `name`):
+  - **Matched** entries are left **byte-for-byte untouched** — custom `description:`, `group:` annotations, tool ordering, and comments all survive. The round-trip YAML writer (ruamel) preserves formatting.
+  - **New** tools (in source, absent from yaml) are **appended at the end, ungrouped**. Assign a `group:` afterward if you want `tool_groups` gating.
+  - **Stale** entries (in yaml, source no longer found) are **reported, not removed** by default — a temporarily-commented-out tool won't vanish on a routine re-ingest.
+  - **No-op** when source and yaml already agree: the file is not rewritten (no spurious git diff / mtime churn), and the CLI says so.
+  - Only the `tools:` array is touched. Metadata, `config:`, and `tool_groups:` blocks are never modified.
+  - Renamed tools are reported plainly as "one new tool + one source-not-found"; no rename-guessing that could migrate a `group:` to the wrong tool.
+- **`scitoolkit ingest --prune`.** In merge mode, actually remove stale entries (yaml tools whose source no longer exists) instead of just warning. Confirms before removing (respects `--yes`/`--no`/`--no-input`).
+
+### Changed
+
+- **Mode is auto-detected by `toolkit.yaml` presence.** `ingest .` with no existing yaml → scaffold (unchanged). With an existing yaml → merge (new). `ingest . --force` → full overwrite from scratch (the escape hatch; previous default-on-existing behavior). The old "toolkit.yaml exists; refusing to overwrite, re-run with --force" refusal is gone — re-running to pick up new tools is the common case and is now non-destructive by default.
+- **`ingest` Next-steps banner simplified.** After 0.5.5's publish auto-register, registration is no longer a required separate step. The banner now reads `validate → login → publish`, with `scitoolkit create` / the web UI offered as an optional "reserve the name first" parenthetical rather than a commanded step. (`scitoolkit init`'s banner is unchanged — separate command.)
+- **README refreshed to the current feature set** (was committed in `057081b` after the 0.6.0 tag). This release carries it to the PyPI project page, which renders the description from the uploaded package and so still showed the old 0.3.0-era README under 0.6.0.
+
+### Tests
+
+- New `tests/test_ingest_merge.py` (15 tests): the load-bearing byte-for-byte preservation of hand-edited entries; new-tool append (ungrouped, at end); no-op-doesn't-rewrite (asserts mtime unchanged); stale warned-not-removed; `--prune` removes (with confirm) and `--prune --no` keeps; renamed tool reports both facts without migration; `config:`/`tool_groups:` untouched; comments + ordering survive; `--force` full overwrite; scaffold mode unchanged; the 0.5.3 dropped-file warning still fires in merge mode.
+- Updated `tests/test_ingest_command.py` and `tests/test_ingest_yaml_emit.py`: the existing-yaml-no-force path now asserts merge behavior (was refuse-to-overwrite); Next-steps banner tests assert the new `validate → login → publish` + optional-registration wording.
+
+---
+
 ## [0.6.0] — 2026-05-20
 
 `stk install` gains scope/source flags (`-e` / `-l` / `-g`) and the install-time "where do you want this?" prompt is removed in favor of a sensible default (`-g`, global) plus explicit opt-in flags. This closes Tier-1 #14 (editable installs) and GitHub issue #8. The driver: iterating on a toolkit's code locally without the publish→install round-trip on every change — `stk install -e .` is the `pip install -e .` parallel.

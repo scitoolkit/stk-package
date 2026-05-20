@@ -76,7 +76,11 @@ class TestDryRun:
 
 
 class TestExistingYamlBehavior:
-    def test_blocks_in_no_input_mode(self, tmp_path):
+    def test_merges_in_no_input_mode(self, tmp_path):
+        # 0.6.1: an existing toolkit.yaml without --force is no longer a
+        # consequential overwrite — it's a non-destructive MERGE, so
+        # --no-input proceeds (no prompt to abort on). Metadata is
+        # preserved and the discovered tool is appended.
         _make_repo_with_one_tool(tmp_path)
         (tmp_path / "toolkit.yaml").write_text(
             "name: existing\nversion: 1.0.0\n", encoding="utf-8"
@@ -85,10 +89,11 @@ class TestExistingYamlBehavior:
         result = runner.invoke(
             main, ["ingest", str(tmp_path), "--no-input"]
         )
-        # Consequential prompt + skip mode = abort.
-        assert result.exit_code != 0
-        # File preserved unchanged.
-        assert "existing" in (tmp_path / "toolkit.yaml").read_text()
+        assert result.exit_code == 0, result.output
+        content = (tmp_path / "toolkit.yaml").read_text()
+        assert "existing" in content       # metadata preserved
+        assert "my_tool" in content        # tool merged in
+        assert "Merge complete" in result.output
 
     def test_force_overwrites(self, tmp_path):
         _make_repo_with_one_tool(tmp_path)
@@ -172,47 +177,50 @@ class TestSummaryOutput:
 
 
 class TestNextStepsBanner:
-    """Regression test for issue #4: the Next-steps banner must walk
-    the author through registration before publish, so they don't hit a
-    confusing 404 from the registry on first publish.
+    """Issue #4 / #5: the Next-steps banner should orient the author on
+    registration without commanding it as a required step. After 0.5.5's
+    publish auto-register, the banner is validate -> login -> publish,
+    with create/web-UI offered as an optional "reserve the name first"
+    parenthetical (not a commanded step that implies publish 404s).
     """
 
-    def test_mentions_create_and_web_ui_registration(self, tmp_path):
+    def test_mentions_optional_registration(self, tmp_path):
         _make_repo_with_one_tool(tmp_path)
         runner = CliRunner()
         result = runner.invoke(
             main, ["ingest", str(tmp_path), "--no-input"]
         )
         assert result.exit_code == 0, result.output
-        # The CLI flow.
+        # The optional name-reservation paths are still mentioned.
         assert "scitoolkit create" in result.output
-        # The web flow.
         assert "scitoolkit.org" in result.output
-        # The publish flow comes after registration in the listing.
+        # The three plain steps.
+        assert "scitoolkit validate" in result.output
         assert "scitoolkit login" in result.output
         assert "scitoolkit publish" in result.output
+        # No longer a commanded "Register the toolkit" step.
+        assert "Register the toolkit" not in result.output
 
-    def test_register_line_appears_after_validate(self, tmp_path):
+    def test_publish_appears_after_validate_and_login(self, tmp_path):
         _make_repo_with_one_tool(tmp_path)
         runner = CliRunner()
         result = runner.invoke(
             main, ["ingest", str(tmp_path), "--no-input"]
         )
         assert result.exit_code == 0
-        # In the Next-steps banner specifically, validate must come
-        # before register, which must come before publish. Anchor on
-        # the "Next steps:" header to skip earlier mentions in the
-        # requirements warning.
+        # In the Next-steps banner: validate -> login -> publish.
+        # Anchor on the "Next steps:" header to skip earlier mentions in
+        # the requirements warning.
         out = result.output
         nxt = out.find("Next steps:")
         assert nxt >= 0, out
         tail = out[nxt:]
         i_validate = tail.find("scitoolkit validate")
-        i_register = tail.find("Register the toolkit")
+        i_login = tail.find("scitoolkit login")
         i_publish = tail.find("scitoolkit publish")
         assert i_validate >= 0
-        assert i_register > i_validate
-        assert i_publish > i_register
+        assert i_login > i_validate
+        assert i_publish > i_login
 
 
 class TestDroppedFileWarning:

@@ -165,14 +165,22 @@ class TestIngestEntryPoint:
         assert result.wrote is True
         assert (tmp_path / "toolkit.yaml").exists()
 
-    def test_blocks_when_existing_and_no_overwrite(self, tmp_path):
+    def test_merges_when_existing_and_no_overwrite(self, tmp_path):
+        # 0.6.1: an existing toolkit.yaml without --force triggers MERGE
+        # mode (not the old refuse-to-overwrite). The discovered tool is
+        # new (the existing yaml has no tools: key), so it's appended;
+        # the existing metadata key is preserved.
         self._make_simple_repo(tmp_path)
         (tmp_path / "toolkit.yaml").write_text("name: existing\n", encoding="utf-8")
         result = ingest(tmp_path, output=None, overwrite=False, dry_run=False)
-        assert result.wrote is False
-        assert result.overwrite_blocked is True
-        # Original file is untouched
-        assert (tmp_path / "toolkit.yaml").read_text() == "name: existing\n"
+        assert result.merged is True
+        assert result.wrote is True
+        assert result.overwrite_blocked is False
+        data = _read_yaml(tmp_path / "toolkit.yaml")
+        assert data["name"] == "existing"  # metadata preserved
+        assert len(data["tools"]) == 1     # discovered tool appended
+        assert result.merge is not None
+        assert len(result.merge.added) == 1
 
     def test_overwrites_when_flag_set(self, tmp_path):
         self._make_simple_repo(tmp_path)
