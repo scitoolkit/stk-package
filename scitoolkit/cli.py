@@ -384,7 +384,7 @@ class _SectionedGroup(click.Group):
 
 
 @click.group(cls=_SectionedGroup)
-@click.version_option(version="0.5.5", prog_name="scitoolkit")
+@click.version_option(version="0.6.0", prog_name="scitoolkit")
 @click.option(
     "--project-dir",
     "project_dir_override",
@@ -3063,35 +3063,528 @@ def setup_conda_environment(
     return env_name
 
 
+# Source-dir entries symlinked into an editable cache slot. ``tools`` is
+# a directory symlink so new ``.py`` files added under it appear live on
+# the next serve; the rest are the files serve / the host read directly
+# off the slot. ``.venv`` is intentionally NOT in this list — it's built
+# as a real subdir of the slot so it never lands in the user's source.
+_EDITABLE_SYMLINK_ENTRIES = (
+    "toolkit.yaml",
+    "tools",
+    "skills",
+    "setup.py",
+    "requirements.txt",
+    "environment.yml",
+    "README.md",
+)
+
+# Cache-slot version sentinel for editable installs. Unparseable by
+# ``parse_version`` (so it sorts last in ``stk list``) and disjoint from
+# any real semver, so it can never collide with a registry version slot.
+EDITABLE_VERSION = "editable"
+
+
+def _resolve_install_source_path(arg: str) -> Optional[Path]:
+    """Return a resolved Path if ``arg`` is a local path, else None.
+
+    pip-style disambiguation: an argument is a path when it is ``.`` /
+    ``..``, contains a path separator, or resolves to an existing
+    directory. Otherwise it's a registry name. The returned path is
+    resolved but not validated for toolkit.yaml here — callers do that
+    with a target-specific error message.
+    """
+    if arg in (".", ".."):
+        return Path(arg).resolve()
+    if "/" in arg or os.sep in arg or (os.altsep and os.altsep in arg):
+        return Path(arg).resolve()
+    candidate = Path(arg)
+    if candidate.exists() and candidate.is_dir():
+        return candidate.resolve()
+    return None
+
+
+def _pin_after_install(name: str, version: str, *, local_scope: bool) -> None:
+    """Pin (name, version) into the global or active-project manifest.
+
+    ``local_scope=False`` (the -g default) pins into the global
+    default-project manifest. ``local_scope=True`` (-l) pins into the
+    active project's manifest, creating ``.scitoolkit/`` in cwd if no
+    project is found above it. Best-effort: a pin failure warns but
+    doesn't fail the install (the cache slot is already usable; serve
+    falls back to walking the cache).
+    """
+    try:
+        from .envs import (
+            project_manifest_path as _project_manifest_path,
+            add_pin as _add_pin,
+            default_project_root as _default_project_root,
+        )
+        if local_scope:
+            # -l: pin into THIS project. find_project_root walks up for
+            # an existing .scitoolkit/; if none, create one in cwd.
+            from .envs import find_project_root as _find_project_root
+            found = _find_project_root(cwd=Path.cwd())
+            if found is None:
+                project_root = Path.cwd().resolve()
+                _materialize_project_dir(project_root)
+            else:
+                project_root = found
+            manifest_path = _project_manifest_path(project_root)
+            _add_pin(manifest_path, name, version)
+            try:
+                rel = manifest_path.relative_to(Path.cwd())
+                display = f"./{rel}"
+            except ValueError:
+                display = str(manifest_path)
+            console.print(f"[dim]Pinned to this project: {display}[/dim]")
+        else:
+            # -g (default): pin into the global default-project.
+            project_root = _default_project_root()
+            manifest_path = _project_manifest_path(project_root)
+            _add_pin(manifest_path, name, version)
+    except Exception as e:
+        console.print(
+            f"[dim]Note: could not pin {name} to the manifest: {e}[/dim]"
+        )
+
+
+def _install_from_path(
+    source_path: Path,
+    *,
+    editable: bool,
+    local_scope: bool,
+    no_skills: bool,
+    mode: str,
+) -> None:
+    """Install a toolkit from a local source directory.
+
+    Covers two cases:
+      - ``-e`` (editable): symlink the source's content into a cache slot
+        keyed ``editable``, build the venv from the source's
+        requirements, and do NOT pin into the committed manifest (the
+        path is machine-specific). Live: edits to source ``.py`` files
+        appear on the next serve.
+      - ``-g``/``-l`` from a path (non-editable): copy the source into a
+        normal versioned cache slot (version read from toolkit.yaml) and
+        pin per scope, same as a registry install.
+    """
+    yaml_path = source_path / "toolkit.yaml"
+    if not yaml_path.exists():
+        console.print(
+            f"[red]✗ No toolkit.yaml found at {source_path}. "
+            "Is this a toolkit directory?[/red]"
+        )
+        sys.exit(1)
+
+    try:
+        with open(yaml_path) as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        console.print(f"[red]✗ Could not read toolkit.yaml: {e}[/red]")
+        sys.exit(1)
+
+    name = (config.get("name") or "").strip()
+    if not name:
+        console.print(
+            "[red]✗ toolkit.yaml is missing a 'name' field.[/red]"
+        )
+        sys.exit(1)
+
+    from .envs import cache_dir as _envs_cache_dir
+
+    if editable:
+        version = EDITABLE_VERSION
+        console.print(
+            f"\n[bold blue]Installing {name} (editable) from "
+            f"{source_path}[/bold blue]\n"
+        )
+    else:
+        version = (config.get("version") or "").strip()
+        if not version:
+            console.print(
+                "[red]✗ toolkit.yaml is missing a 'version' field.[/red]"
+            )
+            sys.exit(1)
+        console.print(
+            f"\n[bold blue]Installing {name} v{version} from "
+            f"{source_path}[/bold blue]\n"
+        )
+
+    slot = _envs_cache_dir(name, version)
+
+    # Detect env type up front (refuse docker before doing work).
+    try:
+        env_type, python_version = detect_environment_type(source_path, config)
+    except Exception as e:
+        console.print(f"[red]✗ Environment detection error: {e}[/red]")
+        sys.exit(1)
+    if env_type == "docker":
+        console.print(
+            "[red]✗ This toolkit requires Docker mode, which is not yet "
+            "supported.[/red]"
+        )
+        sys.exit(1)
+
+    # Reinstall handling: a pre-existing slot is replaced. For editable
+    # this is the normal "I changed deps, rebuild" path.
+    if slot.exists() or slot.is_symlink():
+        if not editable:
+            console.print(
+                f"[yellow]{name} v{version} is already installed.[/yellow]"
+            )
+            if not _confirm("Reinstall?", default=True, mode=mode):
+                sys.exit(0)
+        _remove_slot(slot)
+
+    slot.mkdir(parents=True, exist_ok=True)
+
+    # Materialize the source into the slot.
+    if editable:
+        _symlink_source_into_slot(source_path, slot)
+        env_source_dir = slot  # symlinks resolve to live source
+    else:
+        # Non-editable path install: copy the tree so the slot is a
+        # frozen snapshot, exactly like a registry tarball extract.
+        for item in source_path.iterdir():
+            if item.name in (".venv", ".git", "__pycache__"):
+                continue
+            dest = slot / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, ignore=shutil.ignore_patterns(
+                    "__pycache__", "*.pyc", ".git",
+                ))
+            else:
+                shutil.copy2(item, dest)
+        env_source_dir = slot
+
+    # Build the environment in the slot (venv lands at <slot>/.venv).
+    console.print()
+    python_path = None
+    env_name = None
+    try:
+        if env_type == "venv":
+            console.print("[bold blue]Setting up environment...[/bold blue]\n")
+            python_path = setup_venv_environment(env_source_dir, console)
+        elif env_type == "conda":
+            verify_conda_available()
+            console.print("[bold blue]Setting up environment...[/bold blue]\n")
+            env_name = setup_conda_environment(
+                env_source_dir, name, python_version, console,
+            )
+    except Exception as e:
+        console.print(f"\n[red]✗ Environment setup failed: {e}[/red]")
+        _remove_slot(slot)
+        raise click.ClickException("Installation failed")
+
+    # Write metadata. For editable, record editable: true + source_path
+    # so stk list can render the live-link indicator and serve can read
+    # the venv interpreter.
+    _write_path_install_meta(
+        slot,
+        name=name,
+        version=version,
+        env_type=env_type,
+        python_version=python_version,
+        python_path=python_path,
+        env_name=env_name,
+        config=config,
+        editable=editable,
+        source_path=source_path if editable else None,
+    )
+
+    console.print(
+        f"\n[bold green]✓ Successfully installed {name} "
+        f"{'(editable)' if editable else 'v' + version}[/bold green]\n"
+    )
+    if editable:
+        console.print(f"Source: [cyan]{source_path}[/cyan] (live link)")
+        console.print(
+            "[dim]Edits to tool source appear on the next `scitoolkit "
+            "serve`. If you change dependencies, re-run "
+            "`scitoolkit install -e .` to rebuild the env.[/dim]"
+        )
+    if env_type == "venv":
+        console.print(f"Environment: venv (Python {python_version})")
+    elif env_type == "conda":
+        console.print(
+            f"Environment: conda env '{env_name}' (Python {python_version})"
+        )
+
+    # Skills surfacing (same as registry install). Reads from the slot,
+    # which for editable resolves through the symlink to live source.
+    _surface_skills_best_effort(name, slot, no_skills)
+
+    # Pinning. Editable installs deliberately stay OUT of the committed
+    # manifest — a machine-specific path won't resolve on a collaborator's
+    # clone. The editable: true + source_path in .install_meta.yaml is the
+    # only place an editable install is tracked.
+    if not editable:
+        _pin_after_install(name, version, local_scope=local_scope)
+    else:
+        console.print(
+            "[dim]Editable installs are not pinned into the project "
+            "manifest (the path is machine-specific).[/dim]"
+        )
+
+    console.print(f"\n[bold]Ready to use! Try:[/bold]")
+    console.print(f"  [cyan]stk list[/cyan]")
+    console.print(f"  [cyan]stk serve {name}[/cyan]")
+    console.print()
+
+
+def _remove_slot(slot: Path) -> None:
+    """Remove a cache slot, whether it's a real dir or a symlink."""
+    if slot.is_symlink():
+        slot.unlink()
+    elif slot.exists():
+        shutil.rmtree(slot)
+
+
+def _symlink_source_into_slot(source_path: Path, slot: Path) -> None:
+    """Symlink the toolkit's source entries into an editable cache slot.
+
+    ``tools/`` is linked as a directory symlink so newly-added tool
+    modules appear live. Only entries that exist in the source are
+    linked. ``.venv`` is never linked — it's built as a real subdir of
+    the slot so the user's source tree stays clean.
+    """
+    for entry in _EDITABLE_SYMLINK_ENTRIES:
+        src = source_path / entry
+        if not src.exists():
+            continue
+        link = slot / entry
+        try:
+            link.symlink_to(src.resolve(), target_is_directory=src.is_dir())
+        except OSError as e:
+            # Windows without symlink privilege, or an exotic FS. Fall
+            # back to a copy with a clear staleness note.
+            console.print(
+                f"[yellow]Could not symlink {entry} ({e}); copying "
+                "instead. Source edits will NOT be live for this "
+                "entry until you re-run install -e.[/yellow]"
+            )
+            if src.is_dir():
+                shutil.copytree(src, link)
+            else:
+                shutil.copy2(src, link)
+
+
+def _write_path_install_meta(
+    slot: Path,
+    *,
+    name: str,
+    version: str,
+    env_type: str,
+    python_version: str,
+    python_path,
+    env_name,
+    config: dict,
+    editable: bool,
+    source_path: Optional[Path],
+) -> None:
+    """Write .stk_meta.json + .install_meta.yaml for a path/editable install."""
+    from .envs import (
+        write_legacy_meta as _write_legacy_meta,
+        write_install_meta as _write_install_meta,
+        compute_and_write_disk_size as _compute_and_write_disk_size,
+    )
+
+    skills_dir = slot / "skills"
+    if skills_dir.exists():
+        skill_files = sorted(
+            p for p in skills_dir.glob("*.md") if not p.name.startswith("._")
+        )
+    else:
+        skill_files = []
+    tools_count = len(config.get("tools", []) or [])
+    has_setup_script = (slot / "setup.py").exists()
+
+    meta = {
+        "name": name,
+        "version": version,
+        "environment": env_type,
+        "python_version": python_version,
+        "tools_count": tools_count,
+        "has_skills": len(skill_files) > 0,
+        "skills_count": len(skill_files),
+        "has_setup_script": has_setup_script,
+        "needs_setup": has_setup_script,
+        "installed_at": datetime.now().isoformat(),
+    }
+    if editable:
+        meta["editable"] = True
+        meta["source_path"] = str(source_path)
+    if env_type == "venv":
+        meta["python_path"] = str(python_path)
+    elif env_type == "conda":
+        meta["env_name"] = env_name
+    _write_legacy_meta(slot, meta)
+
+    extras: dict = {}
+    if env_type == "venv":
+        extras["python_path"] = str(python_path)
+    elif env_type == "conda":
+        extras["env_name"] = env_name
+    extras["tools_count"] = tools_count
+    extras["has_skills"] = len(skill_files) > 0
+    extras["skills_count"] = len(skill_files)
+    extras["has_setup_script"] = has_setup_script
+    if editable:
+        extras["editable"] = True
+        extras["source_path"] = str(source_path)
+    _write_install_meta(
+        slot,
+        name=name,
+        version=version,
+        install_method=env_type or "venv",
+        python_version=python_version or "?",
+        extras=extras,
+    )
+
+    try:
+        _compute_and_write_disk_size(slot)
+    except Exception:
+        pass
+
+
+def _surface_skills_best_effort(name: str, slot: Path, no_skills: bool) -> None:
+    """Surface a toolkit's skills into ~/.claude/skills/ (best-effort)."""
+    skills_dir = slot / "skills"
+    if not skills_dir.exists() or no_skills:
+        return
+    skill_files = sorted(
+        p for p in skills_dir.glob("*.md") if not p.name.startswith("._")
+    )
+    if not skill_files:
+        return
+    console.print(
+        f"Skills: {len(skill_files)} "
+        f"guide{'s' if len(skill_files) != 1 else ''} available"
+    )
+    try:
+        from .skills import install_skills_for_toolkit, CLAUDE_SKILLS_DIR
+        surfaced = install_skills_for_toolkit(name, slot)
+        if surfaced:
+            console.print(
+                f"[dim]Surfaced to {CLAUDE_SKILLS_DIR}/ "
+                f"({len(surfaced)} entr"
+                f"{'ies' if len(surfaced) != 1 else 'y'})[/dim]"
+            )
+    except Exception as e:
+        console.print(
+            f"[yellow]Could not surface skills to ~/.claude/skills: {e}[/yellow]"
+        )
+
+
 @main.command()
 @click.argument('name')
 @click.option('--version', '-v', help='Specific version to install (default: latest)')
+@click.option(
+    '--global', '-g', 'global_scope', is_flag=True, default=False,
+    help=(
+        'Global install (the default): pin into the global default-project '
+        'manifest. Accepts a registry name or a path to a toolkit dir.'
+    ),
+)
+@click.option(
+    '--local', '-l', 'local_scope', is_flag=True, default=False,
+    help=(
+        "Local install: pin into THIS project's manifest "
+        "(<project>/.scitoolkit/manifest.yaml), creating the project if "
+        "needed. Binary still lives in the global cache. Accepts a "
+        "registry name or a path to a toolkit dir."
+    ),
+)
+@click.option(
+    '--editable', '-e', 'editable', is_flag=True, default=False,
+    help=(
+        'Editable install: symlink a local toolkit source dir into the '
+        'cache so serve loads tools live. Path only (no registry name). '
+        'Not pinned into the committed manifest.'
+    ),
+)
 @click.option(
     '--no-skills', 'no_skills', is_flag=True, default=False,
     help="Don't surface the toolkit's skills into ~/.claude/skills/.",
 )
 @_interactive_options
-def install(name, version, no_skills, yes, no_, no_input):
+def install(name, version, global_scope, local_scope, editable, no_skills, yes, no_, no_input):
     """
-    Install a toolkit from the registry.
+    Install a toolkit — from the registry or a local source directory.
+
+    \b
+    Scope/source flags (mutually exclusive; -g is the default):
+      -g / --global    Pin into the global default-project (the default).
+      -l / --local     Pin into THIS project's manifest (.scitoolkit/).
+      -e / --editable  Live symlink to a local source dir (path only).
+
+    \b
+    The toolkit binary (venv/conda env + tools) always lives in the
+    global cache at ~/.scitoolkit/cache/<name>/<version>/, regardless
+    of flag. -g vs -l only changes which manifest gets the pin; -e
+    additionally points the cache slot at your live source folder.
+
+    \b
+    The argument is a registry name OR a local path. It's treated as a
+    path when it is ``.``/``..``, contains a path separator, or resolves
+    to an existing directory; otherwise as a registry name. A path
+    target must contain a toolkit.yaml. (-e requires a path.)
 
     \b
     This will:
-      1. Download the toolkit (latest, or --version <v>)
+      1. Acquire the toolkit (download from registry, or read a local path)
       2. Create an isolated environment (venv or conda, auto-detected)
       3. Install dependencies, then orchestral-ai + mcp
       4. Surface the toolkit's skills into ~/.claude/skills/ (unless --no-skills)
+      5. Pin into the appropriate manifest (-g default-project, -l this project)
 
     \b
     Examples:
-        scitoolkit install aster                   # latest
+        scitoolkit install aster                   # global, latest
         scitoolkit install aster@1.2.0             # pin a version via @ syntax
         scitoolkit install aster --version 1.2.0   # pin a version via flag
-        scitoolkit install aster -v 1.2.0          # short alias
-        scitoolkit install aster --no-skills       # don't touch ~/.claude/skills/
+        scitoolkit install -l aster                # pin into this project
+        scitoolkit install .                        # global install from cwd
+        scitoolkit install -e .                     # editable: live link to cwd
+        scitoolkit install aster --no-skills        # don't touch ~/.claude/skills/
     """
     mode = _resolve_prompt_mode(yes, no_, no_input)
 
+    # Flag exclusivity. -e/-l/-g pick one scope/source; -g is the
+    # default when none is given.
+    if sum(int(b) for b in (editable, local_scope, global_scope)) > 1:
+        raise click.UsageError(
+            "-e, -l, and -g are mutually exclusive. Pick one."
+        )
+
+    # Resolve the argument to either a registry name or a local path,
+    # following pip-style disambiguation. ``-e`` forces path semantics
+    # and rejects a bare name.
+    source_path = _resolve_install_source_path(name)
+    if editable and source_path is None:
+        raise click.UsageError(
+            "Editable installs require a path to a local toolkit "
+            "directory.\n  Usage: stk install -e <path-to-toolkit>"
+        )
+    if editable and version:
+        raise click.UsageError(
+            "--version is meaningless with -e (editable has no registry "
+            "version). Drop --version."
+        )
+
+    # Path-source branch (covers -e always, and -g/-l when the arg is a
+    # path). Builds the cache slot from the local dir and pins per scope.
+    if source_path is not None:
+        _install_from_path(
+            source_path,
+            editable=editable,
+            local_scope=local_scope,
+            no_skills=no_skills,
+            mode=mode,
+        )
+        return
+
+    # Registry-name branch below (the common case).
     # Parse name@version syntax. Both `aster@1.2.0` and `aster --version 1.2.0`
     # work; conflict (both forms specifying versions) raises.
     if "@" in name:
@@ -3420,35 +3913,13 @@ def install(name, version, no_skills, yes, no_, no_input):
     except Exception:
         pass
 
-    # Pin into the active project's manifest. Phase 3 wires real
-    # per-project discovery via ``_resolve_active_project_root``: walk
-    # upward looking for ``.scitoolkit/manifest.yaml``; if none found
-    # and we're in a TTY, ask whether to create one in cwd; otherwise
-    # silently fall back to ``~/.scitoolkit/default-project/``. The
-    # cache slot itself is project-agnostic; only the pin is per-project.
-    try:
-        from .envs import (
-            project_manifest_path as _project_manifest_path,
-            add_pin as _add_pin,
-        )
-        project_root, _source = _resolve_active_project_root(
-            allow_implicit_create=True,
-            mode=mode,
-            create_message=(
-                f"No .scitoolkit/ found above {Path.cwd()}. Create one here "
-                "to pin this toolkit to the project? (No = pin to global "
-                "default-project)"
-            ),
-        )
-        manifest_path = _project_manifest_path(project_root)
-        _add_pin(manifest_path, name, version)
-    except Exception as e:
-        # Manifest pinning is best-effort during Phase 2; serve will
-        # fall back to walking the cache if no manifest is found.
-        # Phase 3 makes the manifest authoritative.
-        console.print(
-            f"[dim]Note: could not pin to default-project manifest: {e}[/dim]"
-        )
+    # Pin into the appropriate manifest. -g (default) pins into the
+    # global default-project; -l pins into THIS project's manifest
+    # (creating it if needed). The cache slot itself is always in the
+    # global cache and project-agnostic — only the pin is scoped. There
+    # is deliberately no "where do you want this?" prompt: the flag (or
+    # its -g default) carries that intent now.
+    _pin_after_install(name, version, local_scope=local_scope)
 
     # Step 9: Success message
     console.print(f"\n[bold green]✓ Successfully installed {name} v{version}[/bold green]\n")
@@ -3732,13 +4203,23 @@ def list_cmd(as_json):
             marker = " [yellow]*[/yellow]" if pinned else ""
             last_used = _format_last_used(entry.last_used_iso)
             size = _format_disk_size(entry.disk_size_bytes)
+            # Editable slots show a "-> <source>" indicator so it's
+            # obvious the slot is a live link, not a frozen install.
+            meta = entry.install_meta or {}
+            editable_src = meta.get("source_path") if meta.get("editable") else None
             # Version column padded a little so the parenthetical
             # aligns across rows that have / don't have the pin marker.
             ver_cell = f"{entry.version}{marker}"
-            console.print(
-                f"  - {ver_cell}   "
-                f"[dim](used {last_used}, {size})[/dim]"
-            )
+            if editable_src:
+                console.print(
+                    f"  - {ver_cell}   "
+                    f"[dim](-> {editable_src}, used {last_used}, {size})[/dim]"
+                )
+            else:
+                console.print(
+                    f"  - {ver_cell}   "
+                    f"[dim](used {last_used}, {size})[/dim]"
+                )
 
     if any_pin_applied and manifest_path is not None:
         # Render the manifest path relative to cwd when possible — keeps

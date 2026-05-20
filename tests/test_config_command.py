@@ -33,11 +33,27 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     The 0.5.0 cache layout puts toolkit binaries under
     ``~/.scitoolkit/cache/<name>/<version>/``. The resolver pattern in
     ``envs/paths.py`` re-reads ``CONFIG_DIR`` on every call so a single
-    monkeypatch suffices.
+    monkeypatch suffices for the *user* scope.
+
+    The *project* scope is discovered by walking up from ``cwd`` for a
+    ``.scitoolkit/manifest.yaml`` (``envs/discovery.find_project_root``).
+    A monkeypatch of CONFIG_DIR does NOT redirect that walk — so if the
+    test process's cwd is inside a tree that has a ``.scitoolkit/`` above
+    it (e.g. running pytest from the repo root after a ``stk install -l``
+    dropped one there), config commands that resolve a project layer would
+    read/write the real repo's ``.scitoolkit/`` instead of tmp, and tests
+    would both fail and pollute the repo. Pin cwd to a clean tmp project
+    dir so the upward walk finds nothing and falls back to the
+    (CONFIG_DIR-rooted) default-project. This keeps the whole substrate —
+    user scope AND project scope — inside tmp regardless of where pytest
+    is invoked from.
     """
     fake = tmp_path / "scitoolkit"
     fake.mkdir()
     monkeypatch.setattr(scitoolkit_config, "CONFIG_DIR", fake)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
     return fake
 
 

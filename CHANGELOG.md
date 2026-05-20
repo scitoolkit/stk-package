@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [0.6.0] — 2026-05-20
+
+`stk install` gains scope/source flags (`-e` / `-l` / `-g`) and the install-time "where do you want this?" prompt is removed in favor of a sensible default (`-g`, global) plus explicit opt-in flags. This closes Tier-1 #14 (editable installs) and GitHub issue #8. The driver: iterating on a toolkit's code locally without the publish→install round-trip on every change — `stk install -e .` is the `pip install -e .` parallel.
+
+### Added
+
+- **`stk install -e <path>` (editable installs).** Symlinks a local toolkit source directory into the cache slot `~/.scitoolkit/cache/<name>/editable/` so `scitoolkit serve` loads tools from the live source — edit a tool's `.py`, restart serve, the edit is live. The venv/conda env is built once in the slot from the source's `requirements.txt`/`environment.yml` and cached; only the source is symlinked. Path only (a bare registry name errors). `--version` is rejected (editable has no registry version). If you change dependencies, re-run `stk install -e .` to rebuild the env. **Editable installs are not pinned into the committed manifest** — the machine-specific path wouldn't resolve on a collaborator's clone; they're tracked via `editable: true` + `source_path` in the slot's `.install_meta.yaml`.
+- **`stk install -l <name|path>` (local / project-scoped).** Pins the toolkit into THIS project's manifest (`<project>/.scitoolkit/manifest.yaml`), creating the project dir in cwd if none is found above it. The binary still lives in the global cache (same as `-g`) — `-l` is a manifest-scoping flag, not a binary-relocation flag. A collaborator who clones the project runs `stk install` (no args) and gets the same toolkits at the same versions.
+- **`stk install -g <name|path>` (global) — the default.** Pins into the global default-project manifest. `stk install <name>` and `stk install -g <name>` are identical.
+- **Path sources for install.** The install argument can now be a local path (pip-style disambiguation: `.`/`..`, contains a separator, or resolves to an existing directory → path; otherwise a registry name). `stk install .` does a global install from a local toolkit dir. A path target must contain a `toolkit.yaml`.
+- **`stk list` renders editable slots with a `-> <source-path>` indicator**, e.g. `- editable   (-> /Users/tony/dev/heptapod, used 2 min ago, 387 MB)`, making it obvious the slot is a live link, not a frozen install.
+
+### Changed
+
+- **Removed the install-time "create a project here?" prompt.** Install location is now carried by the flag (or its `-g` default). `--no-input` / non-TTY installs take the global default with no prompt. This replaces the per-install location question with a default + opt-in.
+
+### Internal
+
+- New install helpers in `cli.py`: `_resolve_install_source_path` (path-vs-name), `_install_from_path` (editable + path-source installs), `_symlink_source_into_slot`, `_write_path_install_meta`, `_pin_after_install` (scope-aware manifest pinning), `_surface_skills_best_effort`, `_remove_slot`. New constant `EDITABLE_VERSION = "editable"`.
+- The editable cache slot is a real directory holding `.venv/` + metadata, with `toolkit.yaml`, `tools/`, `skills/`, `setup.py`, `requirements.txt`, `environment.yml`, `README.md` symlinked from the source (directory symlink for `tools/` so new modules appear live). `.venv` is never symlinked, so the user's source tree stays clean. The orchestrator follows the symlinks transparently — no serve-side changes needed.
+
+### Tests
+
+- New `tests/test_install_flags.py` (16 tests): path-vs-name disambiguation, flag exclusivity, editable-requires-path / version-meaningless errors, path-without-toolkit.yaml error, editable symlinks-source/builds-venv/writes-editable-meta/no-manifest-pin, `-l` pins project manifest (not default-project), `-g`/default pins default-project, `stk list` editable indicator, removed-prompt (no prompt in skip mode). 965 unit tests green.
+- New `tests/e2e/run_editable_e2e.py`: editable install → serve → call (v1) → edit source in place → re-serve → call (v2) confirms the edit is live through the symlink.
+- **Test-isolation fix in `tests/test_config_command.py`.** The `isolated` fixture monkeypatched `CONFIG_DIR` (user scope) but not cwd, so the config command's project-discovery upward walk could escape into an ancestor `.scitoolkit/` (e.g. one a `stk install -l` dropped at the repo root) and read/write there instead of tmp — failing the tests and polluting the repo. The fixture now also `monkeypatch.chdir()`s into a clean tmp project dir so the walk finds nothing and falls back to the CONFIG_DIR-rooted default-project. Full suite from the repo root is now 965 passed, 0 failed (was 955/10-fail), invocation-cwd-independent.
+
+---
+
 ## [0.5.5] — 2026-05-15
 
 Bundle of three independent fixes: the urgent one closes GitHub issue #5 — `scitoolkit publish` now auto-registers a toolkit on the registry on first run instead of bailing out with an opaque 404, so a brand-new toolkit can be shipped with just `scitoolkit login` + `scitoolkit publish`. The two queue-clearing items: `scitoolkit init`'s misleading "registry" wording is fixed, and a `serve.log` wiring regression that left `~/.scitoolkit/logs/serve.log` empty during serve sessions is fixed and pinned with a test.
